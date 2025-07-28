@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+websockets
+httpx
+redis  # Redis client for agent state persistence
+pydantic
+watchdog
+pytest
+psutil  # System monitoring 
