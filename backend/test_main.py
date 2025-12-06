@@ -83,6 +83,9 @@ def test_agent_learning_and_persistence():
 
 def test_caretaker_propose_and_apply():
     """Test caretaker agent's propose and apply code change endpoints and log."""
+    # Ensure no auth required in this test
+    import main as app_main
+    app_main.CARETAKER_API_KEY = None
     # Propose a change
     proposal = {"change_request": "Refactor agent learning logic"}
     response = client.post("/api/caretaker/propose", json=proposal)
@@ -103,3 +106,35 @@ def test_caretaker_propose_and_apply():
     assert log[-1]["action"] == "apply"
     assert log[-2]["request"] == "Refactor agent learning logic"
     assert log[-1]["request"] == "Add monitoring endpoint" 
+
+
+def test_task_crud():
+    """Ensure task lifecycle works end-to-end."""
+    create_resp = client.post("/api/tasks", json={"agent_id": "agent-1", "description": "test task"})
+    assert create_resp.status_code == 200
+    created = create_resp.json()
+    assert created["status"] == "pending"
+
+    list_resp = client.get("/api/tasks")
+    assert list_resp.status_code == 200
+    tasks = list_resp.json()
+    assert any(t["id"] == created["id"] for t in tasks)
+
+    update_resp = client.put(f"/api/tasks/{created['id']}", json={"status": "in_progress"})
+    assert update_resp.status_code == 200
+    updated = update_resp.json()
+    assert updated["status"] == "in_progress"
+
+
+def test_caretaker_requires_key_when_configured():
+    import main as app_main
+    app_main.CARETAKER_API_KEY = "secret"
+    res = client.post("/api/caretaker/propose", json={"change_request": "x"})
+    assert res.status_code == 401
+    res2 = client.post(
+        "/api/caretaker/propose",
+        json={"change_request": "x"},
+        headers={"x-api-key": "secret"},
+    )
+    assert res2.status_code == 200
+    app_main.CARETAKER_API_KEY = None

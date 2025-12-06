@@ -7,6 +7,8 @@ export type Agent = {
   task: string | null;
   last_ollama_response: string | null;
   learning_state: Record<string, unknown>;
+  mood?: string;
+  last_notes?: { summary?: string; usage?: string }[];
 };
 
 export type Task = {
@@ -14,8 +16,10 @@ export type Task = {
   agent_id: string;
   description: string;
   status: 'pending' | 'in_progress' | 'completed' | 'failed';
-  created_at: string;
-  updated_at: string;
+  priority: 'low' | 'normal' | 'high' | 'critical';
+  status_history?: { status: string; ts: number; note?: string }[];
+  created_at: number;
+  updated_at: number;
 };
 
 export type AgentStore = {
@@ -28,6 +32,7 @@ export type AgentStore = {
   tasksLoading: boolean;
   tasksError: string | null;
   fetchTasks: () => Promise<void>;
+  createTask: (description: string, agentId: string, priority?: Task['priority']) => Promise<void>;
 };
 
 export const useAgentStore = create<AgentStore>((set) => ({
@@ -58,12 +63,36 @@ export const useAgentStore = create<AgentStore>((set) => ({
   fetchTasks: async () => {
     set({ tasksLoading: true, tasksError: null });
     try {
-      // Placeholder: Replace with real API call when backend supports tasks
-      // const res = await fetch('/api/tasks');
-      // if (!res.ok) throw new Error(`Failed to fetch tasks: ${res.status}`);
-      // const data = await res.json();
-      // set({ tasks: data as Task[] });
-      set({ tasks: [] }); // No tasks yet
+      const res = await fetch('/api/tasks');
+      if (!res.ok) throw new Error(`Failed to fetch tasks: ${res.status}`);
+      const data = await res.json();
+      set({ tasks: data as Task[] });
+    } catch (err) {
+      if (err instanceof Error) {
+        set({ tasksError: err.message });
+      } else {
+        set({ tasksError: 'Unknown error' });
+      }
+    } finally {
+      set({ tasksLoading: false });
+    }
+  },
+  createTask: async (description: string, agentId: string, priority: Task['priority'] = 'normal') => {
+    set({ tasksLoading: true, tasksError: null });
+    try {
+      const res = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description, agent_id: agentId, priority }),
+      });
+      if (!res.ok) throw new Error(`Failed to create task: ${res.status}`);
+      await res.json();
+      // Refresh tasks
+      const listRes = await fetch('/api/tasks');
+      if (listRes.ok) {
+        const data = await listRes.json();
+        set({ tasks: data as Task[] });
+      }
     } catch (err) {
       if (err instanceof Error) {
         set({ tasksError: err.message });

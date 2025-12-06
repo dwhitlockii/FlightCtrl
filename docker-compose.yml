@@ -1,0 +1,41 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    command: ["serve"]
+
+  backend:
+    build: ./backend
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - LLM_PROVIDER=ollama
+      - OLLAMA_ENDPOINT=http://ollama:11434
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - FRONTEND_ORIGINS=http://localhost:5173,http://frontend
+    depends_on:
+      - redis
+      - ollama
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    environment:
+      - VITE_WS_URL=ws://localhost:8000/ws/chat
+    ports:
+      - "5173:80"
+
+volumes:
+  ollama:

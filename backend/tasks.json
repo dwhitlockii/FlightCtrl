@@ -1,0 +1,120 @@
+{
+  "5e10e853-08d7-421c-b3d6-73b69f44c790": {
+    "id": "5e10e853-08d7-421c-b3d6-73b69f44c790",
+    "agent_id": "agent-1",
+    "description": "test task",
+    "status": "in_progress",
+    "created_at": 1764941087.7295814,
+    "updated_at": 1764941087.75233
+  },
+  "a11c1790-89cb-4357-b66f-027704c613c6": {
+    "id": "a11c1790-89cb-4357-b66f-027704c613c6",
+    "agent_id": "agent-1",
+    "description": "test task",
+    "status": "in_progress",
+    "created_at": 1764941746.121725,
+    "updated_at": 1764941746.1382797
+  },
+  "ecd4f16f-5c0e-4573-84db-eecb660751e8": {
+    "id": "ecd4f16f-5c0e-4573-84db-eecb660751e8",
+    "agent_id": "agent-1",
+    "description": "test task",
+    "status": "in_progress",
+    "created_at": 1764941776.9553075,
+    "updated_at": 1764941776.9798381
+  },
+  "89a4eec9-d06a-4020-b257-c68558eebe10": {
+    "id": "89a4eec9-d06a-4020-b257-c68558eebe10",
+    "agent_id": "agent-1",
+    "description": "test task",
+    "status": "in_progress",
+    "created_at": 1765004021.9801397,
+    "updated_at": 1765004022.0034268
+  },
+  "88b46d85-0c05-489b-89d9-5553a0019e24": {
+    "id": "88b46d85-0c05-489b-89d9-5553a0019e24",
+    "agent_id": "agent-1",
+    "description": "test task",
+    "status": "in_progress",
+    "priority": "normal",
+    "status_history": [
+      {
+        "status": "pending",
+        "ts": 1765006309.0849767,
+        "note": null
+      },
+      {
+        "status": "in_progress",
+        "ts": 1765006309.1080763,
+        "note": null
+      }
+    ],
+    "created_at": 1765006309.0849767,
+    "updated_at": 1765006309.1080763
+  },
+  "f07b0246-0e79-4202-93e9-a1cd2293d437": {
+    "id": "f07b0246-0e79-4202-93e9-a1cd2293d437",
+    "agent_id": "agent-1",
+    "description": "test task",
+    "status": "in_progress",
+    "priority": "normal",
+    "status_history": [
+      {
+        "status": "pending",
+        "ts": 1765006705.1156566,
+        "note": null
+      },
+      {
+        "status": "in_progress",
+        "ts": 1765006705.138469,
+        "note": null
+      }
+    ],
+    "created_at": 1765006705.1156566,
+    "updated_at": 1765006705.138469
+  },
+  "36138760-910c-45b7-b0ac-5d6e983465e9": {
+    "id": "36138760-910c-45b7-b0ac-5d6e983465e9",
+    "agent_id": "agent-1",
+    "description": "test task",
+    "status": "in_progress",
+    "priority": "normal",
+    "status_history": [
+      {
+        "status": "pending",
+        "ts": 1765008954.4908564,
+        "note": null
+      },
+      {
+        "status": "in_progress",
+        "ts": 1765008954.5109594,
+        "note": null
+      }
+    ],
+    "messages": [],
+    "created_at": 1765008954.4908564,
+    "updated_at": 1765008954.5109594
+  },
+  "bcc97c4a-6e74-44e8-a950-dc1cd3f71b51": {
+    "id": "bcc97c4a-6e74-44e8-a950-dc1cd3f71b51",
+    "agent_id": "agent-1",
+    "description": "test task",
+    "status": "in_progress",
+    "priority": "normal",
+    "status_history": [
+      {
+        "status": "pending",
+        "ts": 1765009460.073182,
+        "note": null
+      },
+      {
+        "status": "in_progress",
+        "ts": 1765009460.0982325,
+        "note": null
+      }
+    ],
+    "messages": [],
+    "created_at": 1765009460.073182,
+    "updated_at": 1765009460.0982325
+  }
+}
