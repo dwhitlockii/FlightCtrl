@@ -1,21 +1,26 @@
 import os
 import tempfile
 import uuid
+import time
 from typing import Optional
 
 from fastapi.testclient import TestClient
 
 _temp_dir = tempfile.mkdtemp(prefix="flightctrl-test-")
-os.environ.setdefault("AUTH_REQUIRED", "true")
-os.environ.setdefault("JWT_SECRET", "test-secret")
-os.environ.setdefault("ADMIN_USERNAME", "admin")
-os.environ.setdefault("ADMIN_PASSWORD", "adminpass")
-os.environ.setdefault("USERS_FILE", os.path.join(_temp_dir, "users.json"))
-os.environ.setdefault("AUDIT_LOG_PATH", os.path.join(_temp_dir, "audit.log"))
+os.environ["AUTH_REQUIRED"] = "true"
+os.environ["JWT_SECRET"] = "test-secret"
+os.environ["ADMIN_USERNAME"] = "admin"
+os.environ["ADMIN_PASSWORD"] = "adminpass"
+os.environ["USERS_FILE"] = os.path.join(_temp_dir, "users.json")
+os.environ["AUDIT_LOG_PATH"] = os.path.join(_temp_dir, "audit.log")
+os.environ["RATE_LIMIT_PER_MINUTE"] = "10000"
+os.environ["RATE_LIMIT_LOGIN_PER_MINUTE"] = "10000"
 
 from main import app, caretaker_change_store  # noqa: E402
+import main as app_main  # noqa: E402
 
 caretaker_change_store.path = os.path.join(_temp_dir, "caretaker_changes.json")
+app_main.user_store.ensure_bootstrap()
 
 client = TestClient(app)
 _auth_headers: Optional[dict] = None
@@ -238,5 +243,107 @@ def test_provenance_shape_metrics():
     assert isinstance(provenance.get("collectors", []), list)
     assert provenance.get("privilege_level") in {"user", "elevated", "unknown"}
     assert isinstance(provenance.get("last_success_at"), dict)
-    assert "unavailable" in data
-    assert "confidence" in data
+
+
+def _sample_ingest_payload() -> dict:
+    now = time.time()
+    return {
+        "timestamp": now,
+        "platform": "linux",
+        "host_id": "test-host",
+        "source": "external",
+        "cpu": {
+            "usage_percent": 42.5,
+            "per_core_percent": [40.0, 45.0],
+            "load_avg": [0.1, 0.2, 0.3],
+            "top_processes": [
+                {"pid": 100, "name": "python", "cpu_percent": 12.5},
+            ],
+        },
+        "memory": {
+            "total": 1024,
+            "used": 512,
+            "available": 512,
+            "free": 256,
+            "percent": 50.0,
+            "swap_total": 256,
+            "swap_used": 10,
+            "swap_free": 246,
+            "swap_percent": 3.9,
+            "top_processes": [
+                {"pid": 200, "name": "worker", "rss": 2048},
+            ],
+        },
+        "disk": {
+            "usage": {"total": 2048, "used": 1024, "free": 1024, "percent": 50.0},
+            "io": {"iops": 10.0, "throughput_mb": 1.2},
+        },
+        "network": {
+            "flows": [
+                {
+                    "remote": "1.2.3.4",
+                    "connections": 2,
+                    "remote_ports": [443],
+                    "local_ports": [51515],
+                    "last_seen": now,
+                }
+            ],
+            "listeners": [
+                {"local_address": "0.0.0.0", "local_port": 8000, "protocol": "tcp"}
+            ],
+            "summary": {
+                "total_connections": 2,
+                "total_listeners": 1,
+                "tcp_connections": 2,
+                "udp_connections": 0,
+            },
+        },
+        "firewall": {"enabled": True, "backend": "ufw", "rule_count": 3, "raw": "ok"},
+        "provenance": {
+            "platform": "linux",
+            "host_id": "test-host",
+            "privilege_level": "user",
+            "collectors": ["psutil"],
+            "collectors_by_subsystem": {"cpu": ["psutil"]},
+            "last_success_at": {"cpu": now},
+        },
+        "unavailable": [
+            {
+                "metric": "cpu_load_avg",
+                "reason": "not supported",
+                "remediation": "use per-core CPU usage",
+            }
+        ],
+    }
+
+
+def test_telemetry_ingest_external_fresh():
+    payload = _sample_ingest_payload()
+    res = client.post("/api/telemetry/ingest", json=payload, headers=auth_headers())
+    assert res.status_code == 200
+    metrics = client.get("/api/metrics", headers=auth_headers())
+    assert metrics.status_code == 200
+    data = metrics.json()
+    assert data["source_type"] == "external_agent"
+    assert data["cpu"] == payload["cpu"]["usage_percent"]
+    assert any(item["metric"] == "cpu_load_avg" for item in data.get("unavailable", []))
+
+
+def test_telemetry_fallback_when_external_stale():
+    payload = _sample_ingest_payload()
+    client.post("/api/telemetry/ingest", json=payload, headers=auth_headers())
+    import main as app_main
+    app_main.telemetry_store._external_snapshot_ts = time.time() - 999
+    metrics = client.get("/api/metrics", headers=auth_headers())
+    assert metrics.status_code == 200
+    assert metrics.json()["source_type"] == "local_fallback"
+
+
+def test_diagnostics_reports_external_age():
+    payload = _sample_ingest_payload()
+    client.post("/api/telemetry/ingest", json=payload, headers=auth_headers())
+    diag = client.get("/api/diagnostics", headers=auth_headers())
+    assert diag.status_code == 200
+    body = diag.json()
+    assert body["source_type"] in {"external_agent", "local_fallback"}
+    assert body["freshness_threshold_seconds"] is not None

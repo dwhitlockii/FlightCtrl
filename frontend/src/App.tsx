@@ -48,6 +48,14 @@ type ChatMessage = {
   streaming?: boolean;
   ts: number;
 };
+type Diagnostics = {
+  platform?: string;
+  source_type?: string;
+  external_age_seconds?: number | null;
+  freshness_threshold_seconds?: number | null;
+  ws_active?: boolean;
+  remediation?: string | null;
+};
 
 const formatValue = (value: unknown): string => {
   if (value === null || value === undefined) return '';
@@ -104,6 +112,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [newTaskDesc, setNewTaskDesc] = useState('');
   const [newTaskAgent, setNewTaskAgent] = useState('');
@@ -230,6 +239,8 @@ export default function App() {
       try {
         const healthRes = await authFetch("/api/health");
         if (healthRes.ok) setHealth(await healthRes.json());
+        const diagRes = await authFetch("/api/diagnostics");
+        if (diagRes.ok) setDiagnostics(await diagRes.json());
         const metricsRes = await authFetch("/api/metrics");
         if (metricsRes.ok) setMetrics(await metricsRes.json());
         const flowRes = await authFetch("/api/network/flows");
@@ -833,6 +844,17 @@ export default function App() {
               </div>
             </div>
           </div>
+          {diagnostics?.source_type !== 'external_agent' && (
+            <Card className="mb-4 border border-amber-400/40 bg-amber-500/10 text-amber-100">
+              <div className="text-sm font-semibold">HOST TELEMETRY UNAVAILABLE</div>
+              <div className="text-xs text-amber-200 mt-1">
+                Source: {diagnostics?.source_type || 'unknown'} | External age: {diagnostics?.external_age_seconds ?? 'n/a'}s
+              </div>
+              <div className="text-xs text-amber-200 mt-2">
+                {diagnostics?.remediation || 'Run the host telemetry agent with required privileges.'}
+              </div>
+            </Card>
+          )}
           {activeTab === 'chat' && (
             <Card className="flex-1 flex flex-col">
               <div className="flex items-center justify-between mb-2">

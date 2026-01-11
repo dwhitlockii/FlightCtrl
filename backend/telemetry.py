@@ -52,6 +52,16 @@ class TelemetryStore:
         self._external_seen: bool = False
         self._external_provenance: Optional[Dict] = None
         self._firewall_rules_ts: Optional[float] = None
+        self._external_snapshot_ts: Optional[float] = None
+        self._external_platform: Optional[str] = None
+        self._external_host_id: Optional[str] = None
+        self._external_unavailable: List[Dict] = []
+        self._external_cpu: Optional[Dict] = None
+        self._external_memory: Optional[Dict] = None
+        self._external_disk: Optional[Dict] = None
+        self._external_disk_io_detail: Optional[Dict] = None
+        self._external_network: Optional[Dict] = None
+        self._external_firewall: Optional[Dict] = None
 
     def _external_fresh(self, ts: Optional[float]) -> bool:
         return ts is not None and (time.time() - ts) <= self.external_ttl
@@ -62,6 +72,10 @@ class TelemetryStore:
         provenance = payload.get("provenance")
         if isinstance(provenance, dict):
             self._external_provenance = provenance
+        self._external_snapshot_ts = now
+        unavailable = payload.get("unavailable")
+        if isinstance(unavailable, list):
+            self._external_unavailable = list(unavailable)
         host = payload.get("host")
         if host:
             self._external_host = host
@@ -104,6 +118,61 @@ class TelemetryStore:
             self._external_flows = list(flows)
             self._external_flows_ts = now
 
+    def ingest_external_snapshot(self, payload: Dict) -> None:
+        now = payload.get("timestamp") or time.time()
+        self._external_seen = True
+        self._external_snapshot_ts = now
+        self._external_platform = payload.get("platform")
+        self._external_host_id = payload.get("host_id")
+        provenance = payload.get("provenance")
+        if isinstance(provenance, dict):
+            self._external_provenance = provenance
+        unavailable = payload.get("unavailable")
+        if isinstance(unavailable, list):
+            self._external_unavailable = list(unavailable)
+        else:
+            self._external_unavailable = []
+        self._external_cpu = payload.get("cpu") if isinstance(payload.get("cpu"), dict) else None
+        self._external_memory = payload.get("memory") if isinstance(payload.get("memory"), dict) else None
+        self._external_disk = payload.get("disk") if isinstance(payload.get("disk"), dict) else None
+        self._external_network = payload.get("network") if isinstance(payload.get("network"), dict) else None
+        self._external_firewall = payload.get("firewall") if isinstance(payload.get("firewall"), dict) else None
+        if self._external_cpu or self._external_memory or self._external_disk:
+            self._latest_detail = {
+                "cpu": (self._external_cpu or {}).get("usage_percent"),
+                "memory": self._external_memory,
+                "disk": (self._external_disk or {}).get("usage"),
+                "source": "external",
+            }
+        disk_io = None
+        if isinstance(self._external_disk, dict):
+            disk_io = self._external_disk.get("io")
+        if isinstance(disk_io, dict):
+            self._external_disk_io_detail = dict(disk_io)
+            self._external_disk_ts = now
+            point = dict(self._external_disk_io_detail)
+            point.setdefault("ts", now)
+            point.setdefault("source", "external")
+            self._disk_io_history.append(point)
+            self._disk_io_history = self._disk_io_history[-self.disk_history_limit :]
+        self._external_metrics_ts = now if (self._external_cpu or self._external_memory or self._external_disk) else None
+        if self._external_metrics_ts:
+            cpu_val = (self._external_cpu or {}).get("usage_percent")
+            mem_percent = (self._external_memory or {}).get("percent")
+            disk_usage = (self._external_disk or {}).get("usage")
+            disk_percent = disk_usage.get("percent") if isinstance(disk_usage, dict) else None
+            self._metrics_history.append({
+                "ts": now,
+                "cpu": cpu_val,
+                "mem": mem_percent,
+                "disk": disk_percent,
+            })
+            cutoff = now - self.history_seconds
+            self._metrics_history = [p for p in self._metrics_history if p["ts"] >= cutoff]
+        if isinstance(self._external_network, dict) and self._external_network.get("flows") is not None:
+            self._external_flows = list(self._external_network.get("flows", []))
+            self._external_flows_ts = now
+
     def sample(self) -> Optional[Dict]:
         with self._lock:
             metrics = self._collect_metrics_locked()
@@ -114,8 +183,25 @@ class TelemetryStore:
     def get_metrics_detail(self) -> Optional[Dict]:
         with self._lock:
             now = time.time()
-            if self._external_fresh(self._external_metrics_ts):
-                return self._latest_detail
+            if self._external_fresh(self._external_snapshot_ts) and (self._external_cpu or self._external_memory or self._external_disk):
+                cpu = self._external_cpu or {}
+                memory = self._external_memory
+                disk = None
+                if isinstance(self._external_disk, dict):
+                    disk = self._external_disk.get("usage") or self._external_disk.get("usage_bytes")
+                return {
+                    "cpu": cpu.get("usage_percent"),
+                    "cpu_per_core": cpu.get("per_core_percent"),
+                    "load_avg": cpu.get("load_avg"),
+                    "memory": memory,
+                    "disk": disk,
+                    "source": "external",
+                }
+            if self._latest_detail and self._latest_detail.get("source") == "external":
+                metrics = self._collect_metrics_locked()
+                if isinstance(metrics, dict):
+                    metrics.setdefault("source", "local")
+                return metrics
             if now - self._latest_metrics_ts > self.sample_interval:
                 metrics = self._collect_metrics_locked()
                 if isinstance(metrics, dict):
@@ -165,20 +251,24 @@ class TelemetryStore:
     def get_network_flows(self, firewall_rules: List[Dict]) -> Dict:
         now = time.time()
         with self._lock:
-            if self._external_fresh(self._external_flows_ts) and self._external_flows is not None:
+            if self._external_fresh(self._external_snapshot_ts) and isinstance(self._external_network, dict):
+                flows = self._external_network.get("flows")
                 return {
-                    "host": self._external_host or platform.node(),
+                    "host": self._external_host_id or self._external_host or platform.node(),
                     "host_ip": self._external_host_ip,
                     "source": "external",
-                    "flows": list(self._external_flows),
+                    "flows": list(flows) if isinstance(flows, list) else [],
+                    "listeners": self._external_network.get("listeners"),
+                    "summary": self._external_network.get("summary"),
                 }
-            if self._external_seen:
+            if self._external_seen and self._external_snapshot_ts:
                 return {
-                    "host": self._external_host or platform.node(),
+                    "host": self._external_host_id or self._external_host or platform.node(),
                     "host_ip": self._external_host_ip,
                     "source": "external",
                     "note": "external flows unavailable",
                     "flows": [],
+                    "listeners": [],
                 }
             if now - self._flow_cache["ts"] <= self.flow_ttl:
                 return {"host": platform.node(), "source": "local", "flows": list(self._flow_cache["flows"])}
@@ -189,8 +279,8 @@ class TelemetryStore:
 
     def get_disk_io(self) -> Dict:
         with self._lock:
-            if self._external_fresh(self._external_disk_ts) and self._external_disk_io:
-                return {"latest": self._external_disk_io, "history": list(self._disk_io_history), "source": "external"}
+            if self._external_fresh(self._external_snapshot_ts) and self._external_disk_io_detail:
+                return {"latest": dict(self._external_disk_io_detail), "history": list(self._disk_io_history), "source": "external"}
             point = self._collect_disk_io_locked()
             history = list(self._disk_io_history)
         return {"latest": point, "history": history, "source": "local"}
@@ -224,12 +314,34 @@ class TelemetryStore:
                 "disk": self._external_metrics_ts or self._latest_metrics_ts or None,
                 "disk_io": self._external_disk_ts or self._last_disk_ts or None,
                 "network_flows": self._external_flows_ts or self._flow_cache.get("ts") or None,
-                "firewall_state": self._firewall_rules_ts,
+                "firewall_state": self._external_snapshot_ts or self._firewall_rules_ts,
             }
 
     def get_external_provenance(self) -> Optional[Dict]:
         with self._lock:
             return dict(self._external_provenance) if self._external_provenance else None
+
+    def external_age_seconds(self) -> Optional[float]:
+        with self._lock:
+            if not self._external_snapshot_ts:
+                return None
+            return time.time() - self._external_snapshot_ts
+
+    def external_fresh(self) -> bool:
+        with self._lock:
+            return self._external_fresh(self._external_snapshot_ts)
+
+    def get_external_unavailable(self) -> List[Dict]:
+        with self._lock:
+            return list(self._external_unavailable)
+
+    def get_external_platform(self) -> Optional[str]:
+        with self._lock:
+            return self._external_platform
+
+    def get_external_firewall(self) -> Optional[Dict]:
+        with self._lock:
+            return dict(self._external_firewall) if isinstance(self._external_firewall, dict) else None
 
     def _collect_metrics_locked(self) -> Optional[Dict]:
         if not psutil:

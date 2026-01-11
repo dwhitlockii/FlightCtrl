@@ -10,7 +10,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Requ
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 import asyncio
 import contextlib
 from pydantic import BaseModel
@@ -74,7 +74,7 @@ telemetry_store = TelemetryStore(
     history_seconds=_int_env("TELEMETRY_HISTORY_SECONDS", 3600),
     flow_ttl=_int_env("TELEMETRY_FLOW_TTL", 5),
     disk_history_limit=_int_env("TELEMETRY_DISK_HISTORY", 200),
-    external_ttl=_int_env("TELEMETRY_EXTERNAL_TTL", 10),
+    external_ttl=_int_env("FRESHNESS_SECONDS", _int_env("TELEMETRY_EXTERNAL_TTL", 5)),
 )
 personality_map: Dict[str, str] = {
     "orchestrator": "Calm coordinator synthesizing inputs and directing specialists.",
@@ -162,7 +162,34 @@ def _freshness_seconds(last_ts: Optional[float]) -> Optional[float]:
     return round(time.time() - last_ts, 2)
 
 
+def _parse_timestamp(value: Optional[Union[float, str]]) -> float:
+    if value is None:
+        return time.time()
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                return time.time()
+    return time.time()
+
+
 def _provenance(subsystem: str, source_type: str) -> Dict[str, Any]:
+    if source_type == "external_agent":
+        external = telemetry_store.get_external_provenance()
+        if isinstance(external, dict):
+            external.setdefault("source_type", source_type)
+            external.setdefault("privilege_level", _privilege_level())
+            external.setdefault("collectors", _collectors_for(subsystem, source_type))
+            external.setdefault("last_success_at", _last_success_times())
+            return external
     return {
         "source_type": source_type,
         "collectors": _collectors_for(subsystem, source_type),
@@ -753,7 +780,7 @@ TASKS_FILE = os.path.join(os.path.dirname(__file__), "tasks.json")
 class StatusEntry(BaseModel):
     status: str
     ts: float
-    note: str | None = None
+    note: Optional[str] = None
 
 
 class Task(BaseModel):
@@ -2082,6 +2109,27 @@ def caretaker_run_plugin(plugin_name: str, http_request: Request, payload: dict 
 def health_check():
     return {"status": "ok", "timestamp": time.time(), "system": platform.system(), "release": platform.release()}
 
+@app.get("/api/diagnostics", dependencies=[Depends(require_min_role("viewer"))])
+def diagnostics():
+    external_age = telemetry_store.external_age_seconds()
+    freshness_threshold = telemetry_store.external_ttl
+    external_fresh = telemetry_store.external_fresh()
+    source_type = "external_agent" if external_fresh else "local_fallback"
+    remediation = None
+    if not external_fresh:
+        remediation = (
+            "Host telemetry unavailable. Run the agent: "
+            "python -m flightctrl_agent --backend http://127.0.0.1:8000 --interval 2"
+        )
+    return {
+        "platform": _platform_key(),
+        "source_type": source_type,
+        "external_age_seconds": round(external_age, 2) if external_age is not None else None,
+        "freshness_threshold_seconds": freshness_threshold,
+        "ws_active": len(manager.active_connections) > 0,
+        "remediation": remediation,
+    }
+
 @app.get("/api/metrics", dependencies=[Depends(require_min_role("viewer"))])
 def system_metrics():
     metrics = telemetry_store.get_metrics_detail()
@@ -2093,7 +2141,7 @@ def system_metrics():
                 key,
                 "psutil not installed or telemetry unavailable",
                 "Install psutil or run the host telemetry agent.",
-            ))
+                ))
     else:
         for key in ("cpu", "memory", "disk"):
             if metrics.get(key) is None:
@@ -2102,23 +2150,41 @@ def system_metrics():
                     "telemetry missing",
                     "Ensure the host telemetry agent is running with required privileges.",
                 ))
+    source_type = _source_type_from(metrics.get("source"))
+    if source_type == "local_fallback":
+        if metrics.get("cpu_per_core") is None:
+            unavailable.append(_unavailable_entry(
+                "cpu_per_core",
+                "Per-core CPU usage unavailable",
+                "Run the host telemetry agent with required privileges.",
+            ))
+        if metrics.get("load_avg") is None:
+            unavailable.append(_unavailable_entry(
+                "cpu_load_avg",
+                "Load average unavailable",
+                "Run the host telemetry agent or use a platform that reports load average.",
+            ))
+    if source_type == "external_agent":
+        external_unavailable = telemetry_store.get_external_unavailable()
+        unavailable.extend([entry for entry in external_unavailable if entry.get("metric") in {"cpu", "memory", "disk", "cpu_load_avg", "cpu_per_core"}])
     latest_metrics.update({
         "cpu": metrics.get("cpu"),
         "mem": metrics.get("memory", {}).get("percent"),
         "disk": metrics.get("disk", {}).get("percent"),
     })
-    source_type = _source_type_from(metrics.get("source"))
     return {
         "cpu": metrics.get("cpu"),
         "memory": metrics.get("memory"),
         "disk": metrics.get("disk"),
+        "cpu_per_core": metrics.get("cpu_per_core"),
+        "load_avg": metrics.get("load_avg"),
         "note": metrics.get("note"),
         "platform": _platform_key(),
         "source_type": source_type,
         "freshness_seconds": _freshness_seconds(_last_success_times().get("cpu")),
         "provenance": _provenance("cpu", source_type),
         "unavailable": unavailable,
-        "confidence": _confidence_score(["cpu", "memory", "disk"], unavailable),
+        "confidence": _confidence_score(["cpu", "memory", "disk", "cpu_per_core", "cpu_load_avg"], unavailable),
     }
 
 @app.get("/api/metrics/history", dependencies=[Depends(require_min_role("viewer"))])
@@ -2198,11 +2264,124 @@ def capabilities():
     }
 
 
+class UnavailableMetric(BaseModel):
+    metric: str
+    reason: str
+    remediation: str
+
+
+class ProcessStat(BaseModel):
+    pid: Optional[int] = None
+    name: Optional[str] = None
+    cpu_percent: Optional[float] = None
+    rss: Optional[int] = None
+
+
+class CPUData(BaseModel):
+    usage_percent: Optional[float] = None
+    per_core_percent: Optional[List[float]] = None
+    load_avg: Optional[List[float]] = None
+    top_processes: Optional[List[ProcessStat]] = None
+
+
+class MemoryData(BaseModel):
+    total: Optional[int] = None
+    used: Optional[int] = None
+    available: Optional[int] = None
+    free: Optional[int] = None
+    percent: Optional[float] = None
+    swap_total: Optional[int] = None
+    swap_used: Optional[int] = None
+    swap_free: Optional[int] = None
+    swap_percent: Optional[float] = None
+    top_processes: Optional[List[ProcessStat]] = None
+
+
+class DiskUsage(BaseModel):
+    total: Optional[int] = None
+    used: Optional[int] = None
+    free: Optional[int] = None
+    percent: Optional[float] = None
+
+
+class DiskIO(BaseModel):
+    read_bytes_per_sec: Optional[float] = None
+    write_bytes_per_sec: Optional[float] = None
+    read_ops_per_sec: Optional[float] = None
+    write_ops_per_sec: Optional[float] = None
+    iops: Optional[float] = None
+    throughput_bytes_per_sec: Optional[float] = None
+    throughput_mb: Optional[float] = None
+
+
+class DiskData(BaseModel):
+    usage: Optional[DiskUsage] = None
+    io: Optional[DiskIO] = None
+
+
+class NetworkFlow(BaseModel):
+    remote: str
+    connections: int
+    remote_ports: List[int] = []
+    local_ports: List[int] = []
+    bytes_in: Optional[int] = None
+    bytes_out: Optional[int] = None
+    threat_score: Optional[int] = None
+    allowed: Optional[bool] = None
+    last_seen: Optional[float] = None
+
+
+class NetworkListener(BaseModel):
+    local_address: Optional[str] = None
+    local_port: Optional[int] = None
+    protocol: Optional[str] = None
+
+
+class NetworkSummary(BaseModel):
+    total_connections: Optional[int] = None
+    total_listeners: Optional[int] = None
+    tcp_connections: Optional[int] = None
+    udp_connections: Optional[int] = None
+
+
+class NetworkData(BaseModel):
+    flows: Optional[List[NetworkFlow]] = None
+    listeners: Optional[List[NetworkListener]] = None
+    summary: Optional[NetworkSummary] = None
+
+
+class FirewallData(BaseModel):
+    enabled: Optional[bool] = None
+    backend: Optional[str] = None
+    rule_count: Optional[int] = None
+    raw: Optional[str] = None
+
+
+class ProvenanceData(BaseModel):
+    platform: Optional[str] = None
+    host_id: Optional[str] = None
+    privilege_level: Optional[str] = None
+    collectors: Optional[List[str]] = None
+    collectors_by_subsystem: Optional[Dict[str, List[str]]] = None
+    last_success_at: Optional[Dict[str, float]] = None
+
+
 class TelemetryIngestRequest(BaseModel):
+    timestamp: Optional[Union[float, str]] = None
+    platform: Optional[str] = None
+    host_id: Optional[str] = None
+    source: Optional[str] = None
+    cpu: Optional[CPUData] = None
+    memory: Optional[MemoryData] = None
+    disk: Optional[DiskData] = None
+    network: Optional[NetworkData] = None
+    firewall: Optional[FirewallData] = None
+    provenance: Optional[ProvenanceData] = None
+    unavailable: Optional[List[UnavailableMetric]] = None
+    # Legacy fields (deprecated)
     ts: Optional[float] = None
     host: Optional[str] = None
     host_ip: Optional[str] = None
-    provenance: Optional[Dict[str, Any]] = None
     metrics: Optional[Dict[str, Any]] = None
     disk_io: Optional[Dict[str, Any]] = None
     flows: Optional[List[Dict[str, Any]]] = None
@@ -2211,7 +2390,28 @@ class TelemetryIngestRequest(BaseModel):
 @app.post("/api/telemetry/ingest")
 def telemetry_ingest(req: TelemetryIngestRequest, request: Request):
     authorize_telemetry_ingest(request)
-    telemetry_store.ingest_external(req.model_dump(exclude_none=True))
+    payload = req.model_dump(exclude_none=True)
+    if req.cpu or req.memory or req.disk or req.network or req.firewall:
+        ts_value = req.timestamp or req.ts
+        timestamp = _parse_timestamp(ts_value)
+        normalized = {
+            "timestamp": timestamp,
+            "platform": req.platform,
+            "host_id": req.host_id or req.host,
+            "source": req.source,
+            "cpu": req.cpu.model_dump(exclude_none=True) if req.cpu else None,
+            "memory": req.memory.model_dump(exclude_none=True) if req.memory else None,
+            "disk": req.disk.model_dump(exclude_none=True) if req.disk else None,
+            "network": req.network.model_dump(exclude_none=True) if req.network else None,
+            "firewall": req.firewall.model_dump(exclude_none=True) if req.firewall else None,
+            "provenance": req.provenance.model_dump(exclude_none=True) if req.provenance else None,
+            "unavailable": [u.model_dump() for u in (req.unavailable or [])],
+        }
+        telemetry_store.ingest_external_snapshot(normalized)
+    else:
+        if "ts" not in payload and req.timestamp:
+            payload["ts"] = _parse_timestamp(req.timestamp)
+        telemetry_store.ingest_external(payload)
     return {"status": "ok"}
 
 
@@ -2227,6 +2427,9 @@ def network_flows():
             payload.get("note", "network flows unavailable"),
             "Run the host telemetry agent with elevated privileges.",
         ))
+    if source_type == "external_agent":
+        external_unavailable = telemetry_store.get_external_unavailable()
+        unavailable.extend([entry for entry in external_unavailable if entry.get("metric") in {"network_flows", "network_listeners"}])
     return {
         **payload,
         "platform": _platform_key(),
@@ -2234,7 +2437,7 @@ def network_flows():
         "freshness_seconds": _freshness_seconds(_last_success_times().get("network_flows")),
         "provenance": _provenance("network_flows", source_type),
         "unavailable": unavailable,
-        "confidence": _confidence_score(["network_flows"], unavailable),
+        "confidence": _confidence_score(["network_flows", "network_listeners"], unavailable),
     }
 
 
@@ -2256,6 +2459,9 @@ def disk_io():
             latest.get("note", "disk I/O stats unavailable"),
             "Install psutil or run the host telemetry agent.",
         ))
+    if source_type == "external_agent":
+        external_unavailable = telemetry_store.get_external_unavailable()
+        unavailable.extend([entry for entry in external_unavailable if entry.get("metric") in {"disk_iops", "disk_throughput"}])
     return {
         **payload,
         "platform": _platform_key(),
@@ -2271,36 +2477,49 @@ def disk_io():
 def firewall_events_feed(limit: int = 50):
     events = telemetry_store.get_firewall_events(firewall_events, limit=limit)
     unavailable: List[Dict[str, str]] = []
-    if not os.getenv("FIREWALL_LOG_PATH"):
+    external_fresh = telemetry_store.external_fresh()
+    source_type = "external_agent" if external_fresh else "local_fallback"
+    snapshot = telemetry_store.get_external_firewall() if external_fresh else None
+    if source_type == "external_agent":
+        external_unavailable = telemetry_store.get_external_unavailable()
+        unavailable.extend([entry for entry in external_unavailable if entry.get("metric") in {"firewall_state", "firewall_rules", "firewall_events"}])
+    if source_type == "local_fallback" and not os.getenv("FIREWALL_LOG_PATH"):
         unavailable.append(_unavailable_entry(
             "firewall_events",
             "FIREWALL_LOG_PATH not configured",
             "Set FIREWALL_LOG_PATH to a readable firewall log.",
         ))
-    source_type = "local_fallback"
     return {
         "events": events,
+        "snapshot": snapshot,
         "platform": _platform_key(),
         "source_type": source_type,
         "freshness_seconds": _freshness_seconds(_last_success_times().get("firewall_state")),
         "provenance": _provenance("firewall_state", source_type),
         "unavailable": unavailable,
-        "confidence": _confidence_score(["firewall_events"], unavailable),
+        "confidence": _confidence_score(["firewall_state", "firewall_events"], unavailable),
     }
 
 
 @app.get("/api/firewall/rules", dependencies=[Depends(require_min_role("viewer"))])
 def firewall_rule_list():
-    rules = telemetry_store.get_firewall_rules()
-    source_type = "local_fallback"
+    external_fresh = telemetry_store.external_fresh()
+    source_type = "external_agent" if external_fresh else "local_fallback"
+    rules = telemetry_store.get_firewall_rules() if not external_fresh else []
+    snapshot = telemetry_store.get_external_firewall() if external_fresh else None
+    unavailable: List[Dict[str, str]] = []
+    if source_type == "external_agent":
+        external_unavailable = telemetry_store.get_external_unavailable()
+        unavailable.extend([entry for entry in external_unavailable if entry.get("metric") in {"firewall_rules"}])
     return {
         "rules": rules,
+        "snapshot": snapshot,
         "platform": _platform_key(),
         "source_type": source_type,
         "freshness_seconds": _freshness_seconds(_last_success_times().get("firewall_state")),
         "provenance": _provenance("firewall_state", source_type),
-        "unavailable": [],
-        "confidence": _confidence_score(["firewall_state"], []),
+        "unavailable": unavailable,
+        "confidence": _confidence_score(["firewall_state", "firewall_rules"], unavailable),
     }
 
 

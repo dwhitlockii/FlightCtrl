@@ -85,12 +85,17 @@ Notes:
 Docker containers cannot see host network connections on macOS. Run the host telemetry agent to forward
 real metrics/flows into the backend:
 ```sh
-pip install psutil
-./scripts/telemetry_agent_ctl.sh start
+python -m pip install -r agent/requirements.txt
+python -m flightctrl_agent --backend http://127.0.0.1:8000 --interval 2
 ```
-Set `TELEMETRY_API_KEY` (and optionally `TELEMETRY_PUSH_URL`) in your shell or `.env` before running.
-Use `./scripts/telemetry_agent_ctl.sh status|stop|restart` to manage the agent. For macOS network
-connections, the script will prompt for sudo once.
+If auth is enabled, set `FLIGHTCTRL_TOKEN` or `FLIGHTCTRL_TELEMETRY_KEY` before running.
+For managed start/stop:
+```sh
+./scripts/telemetry_agent_ctl.sh start
+./scripts/telemetry_agent_ctl.sh status
+./scripts/telemetry_agent_ctl.sh stop
+```
+On macOS and Linux, run with sudo for full network/firewall visibility.
 
 ### Backend
 ```sh
@@ -103,6 +108,13 @@ pip install -r requirements-dev.txt
 # Start backend
 python main.py
 # Run backend tests
+python -m pytest
+```
+
+### Tests (CI-friendly)
+```sh
+python -m pip install -r backend/requirements-dev.txt
+cd backend
 python -m pytest
 ```
 
