@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import 'primereact/resources/themes/lara-light-blue/theme.css';
 import 'primereact/resources/primereact.min.css';
 import 'primeicons/primeicons.css';
@@ -13,6 +13,7 @@ import { AgentAvatar } from './components/AgentAvatar';
 import { AgentProfile } from './components/AgentProfile';
 import { AgentEventConsole } from './components/AgentEventConsole';
 import { Drawer } from './components/ui/Drawer';
+import { Modal } from './components/ui/Modal';
 
 type Health = {
   status: string;
@@ -25,8 +26,18 @@ type Metrics = {
   memory: Record<string, unknown> | null;
   disk: Record<string, unknown> | null;
   note?: string;
+  platform?: string;
+  source_type?: string;
+  freshness_seconds?: number | null;
+  provenance?: {
+    source_type?: string;
+    collectors?: string[];
+    privilege_level?: string;
+    last_success_at?: Record<string, number | null>;
+  };
+  unavailable?: { metric: string; reason: string; remediation: string }[];
+  confidence?: number;
 };
-type PluginResult = { plugin: string; result: unknown } | null;
 type ChatMessage = {
   messageId: string;
   parentId?: string | null;
@@ -38,8 +49,38 @@ type ChatMessage = {
   ts: number;
 };
 
-function Gauge({ label, value, color }: { label: string; value: number; color: string }) {
-  const v = Math.min(Math.max(value, 0), 100);
+const formatValue = (value: unknown): string => {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const withAuthHeaders = (headers: HeadersInit | undefined, token: string | null) => {
+  const finalHeaders = new Headers(headers || {});
+  if (token && !finalHeaders.has('Authorization')) {
+    finalHeaders.set('Authorization', `Bearer ${token}`);
+  }
+  return finalHeaders;
+};
+
+const toPercent = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  return null;
+};
+
+const formatPercent = (value: number | null): string => {
+  if (value === null) return 'n/a';
+  return `${Math.round(value)}%`;
+};
+
+function Gauge({ label, value, color }: { label: string; value: number | null; color: string }) {
+  const v = typeof value === 'number' ? Math.min(Math.max(value, 0), 100) : 0;
+  const display = typeof value === 'number' ? `${Math.round(v)}%` : '--';
   return (
     <div className="flex flex-col items-center">
       <div
@@ -49,7 +90,7 @@ function Gauge({ label, value, color }: { label: string; value: number; color: s
           color: '#e2e8f0',
         }}
       >
-        <div className="w-14 h-14 rounded-full bg-slate-900 grid place-items-center text-xs">{Math.round(v)}%</div>
+        <div className="w-14 h-14 rounded-full bg-slate-900 grid place-items-center text-xs">{display}</div>
       </div>
       <div className="mt-1 text-xs text-gray-400">{label}</div>
     </div>
@@ -64,7 +105,6 @@ export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [ws, setWs] = useState<WebSocket | null>(null);
-  const [pluginResult, setPluginResult] = useState<PluginResult>(null);
   const [newTaskDesc, setNewTaskDesc] = useState('');
   const [newTaskAgent, setNewTaskAgent] = useState('');
   const [newTaskPriority, setNewTaskPriority] = useState<'low' | 'normal' | 'high' | 'critical'>('normal');
@@ -79,10 +119,10 @@ export default function App() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [agentProfile, setAgentProfile] = useState<any | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
-  const [flows, setFlows] = useState<{ host: string; flows: any[] } | null>(null);
-  const [diskIo, setDiskIo] = useState<{ latest: any; history: any[] } | null>(null);
-  const [firewallLive, setFirewallLive] = useState<any[]>([]);
-  const [firewallRulesState, setFirewallRulesState] = useState<any[]>([]);
+  const [flows, setFlows] = useState<{ host: string; host_ip?: string; source_type?: string; note?: string; flows: any[]; platform?: string; freshness_seconds?: number | null; provenance?: any; unavailable?: any[]; confidence?: number } | null>(null);
+  const [diskIo, setDiskIo] = useState<{ latest?: any; history?: any[]; platform?: string; source_type?: string; freshness_seconds?: number | null; provenance?: any; unavailable?: any[]; confidence?: number } | null>(null);
+  const [firewallEvents, setFirewallEvents] = useState<{ events: any[]; platform?: string; source_type?: string; freshness_seconds?: number | null; provenance?: any; unavailable?: any[]; confidence?: number } | null>(null);
+  const [firewallRulesState, setFirewallRulesState] = useState<{ rules: any[]; platform?: string; source_type?: string; freshness_seconds?: number | null; provenance?: any; unavailable?: any[]; confidence?: number } | null>(null);
   const [metricsHistory, setMetricsHistory] = useState<any[]>([]);
   const [automations, setAutomations] = useState<any[]>([]);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
@@ -104,6 +144,16 @@ export default function App() {
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [keywordFilter, setKeywordFilter] = useState<string>('');
   const [typingAgents, setTypingAgents] = useState<Record<string, 'typing' | 'thinking'>>({});
+  const authToken = useAgentStore((s) => s.authToken);
+  const refreshToken = useAgentStore((s) => s.refreshToken);
+  const refreshAuth = useAgentStore((s) => s.refreshAuth);
+  const setAuthTokens = useAgentStore((s) => s.setAuthTokens);
+  const clearAuth = useAgentStore((s) => s.clearAuth);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginLoading, setLoginLoading] = useState(false);
   const agents = useAgentStore((s) => s.agents);
   const agentsLoading = useAgentStore((s) => s.agentsLoading);
   const agentsError = useAgentStore((s) => s.agentsError);
@@ -113,38 +163,96 @@ export default function App() {
   const tasksError = useAgentStore((s) => s.tasksError);
   const fetchTasks = useAgentStore((s) => s.fetchTasks);
   const createTask = useAgentStore((s) => s.createTask);
+  const cpuPercent = toPercent(metrics?.cpu);
+  const memPercent = toPercent(metrics?.memory?.['percent']);
+  const diskPercent = toPercent(metrics?.disk?.['percent']);
+  const flowSummary = useMemo(() => {
+    const list = flows?.flows ?? [];
+    let allowed = 0;
+    let blocked = 0;
+    let unknown = 0;
+    list.forEach((flow) => {
+      if (flow.allowed === true) {
+        allowed += 1;
+      } else if (flow.allowed === false) {
+        blocked += 1;
+      } else {
+        unknown += 1;
+      }
+    });
+    return { total: list.length, allowed, blocked, unknown };
+  }, [flows]);
+  const diskIops = typeof diskIo?.latest?.iops === 'number' ? diskIo.latest.iops : null;
+  const diskThroughput = typeof diskIo?.latest?.throughput_mb === 'number' ? diskIo.latest.throughput_mb : null;
+  const firewallMeta = firewallRulesState ?? firewallEvents;
 
-  const resolveWsUrl = () => {
+  const handleUnauthorized = useCallback(() => {
+    if (authToken || refreshToken) {
+      setLoginError('Session expired. Please log in again.');
+    }
+    clearAuth();
+    setLoginOpen(true);
+  }, [authToken, refreshToken, clearAuth]);
+
+  const authFetch = useCallback(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const res = await fetch(input, {
+      ...init,
+      headers: withAuthHeaders(init.headers, authToken),
+    });
+    if (res.status !== 401) return res;
+    const refreshed = await refreshAuth();
+    if (!refreshed) {
+      handleUnauthorized();
+      return res;
+    }
+    const retry = await fetch(input, {
+      ...init,
+      headers: withAuthHeaders(init.headers, refreshed),
+    });
+    if (retry.status === 401) {
+      handleUnauthorized();
+    }
+    return retry;
+  }, [authToken, refreshAuth, handleUnauthorized]);
+
+  const resolveWsUrl = useCallback(() => {
     const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
-    if (envUrl) return envUrl;
-    const isSecure = window.location.protocol === 'https:';
-    const host = window.location.host;
-    return `${isSecure ? 'wss' : 'ws'}://${host}/ws/chat`;
-  };
+    const base = envUrl ?? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/chat`;
+    if (!authToken) return base;
+    const url = new URL(base, window.location.origin);
+    url.searchParams.set('token', authToken);
+    return url.toString();
+  }, [authToken]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const poll = async () => {
       try {
-        const healthRes = await fetch("/api/health");
-        setHealth(await healthRes.json());
-        const metricsRes = await fetch("/api/metrics");
-        setMetrics(await metricsRes.json());
-        const flowRes = await fetch("/api/network/flows");
+        const healthRes = await authFetch("/api/health");
+        if (healthRes.ok) setHealth(await healthRes.json());
+        const metricsRes = await authFetch("/api/metrics");
+        if (metricsRes.ok) setMetrics(await metricsRes.json());
+        const flowRes = await authFetch("/api/network/flows");
         if (flowRes.ok) setFlows(await flowRes.json());
-        const diskRes = await fetch("/api/disk/io");
+        const diskRes = await authFetch("/api/disk/io");
         if (diskRes.ok) setDiskIo(await diskRes.json());
-        const fwEvRes = await fetch("/api/firewall/events");
-        if (fwEvRes.ok) setFirewallLive(await fwEvRes.json());
-        const fwRulesRes = await fetch("/api/firewall/rules");
-        if (fwRulesRes.ok) setFirewallRulesState(await fwRulesRes.json());
-        const histRes = await fetch("/api/metrics/history?resolution=120");
+        const fwEvRes = await authFetch("/api/firewall/events");
+        if (fwEvRes.ok) {
+          const data = await fwEvRes.json();
+          setFirewallEvents(data?.events ? data : { events: data });
+        }
+        const fwRulesRes = await authFetch("/api/firewall/rules");
+        if (fwRulesRes.ok) {
+          const data = await fwRulesRes.json();
+          setFirewallRulesState(data?.rules ? data : { rules: data });
+        }
+        const histRes = await authFetch("/api/metrics/history?resolution=120");
         if (histRes.ok) setMetricsHistory(await histRes.json());
-        const autoRes = await fetch("/api/automations");
+        const autoRes = await authFetch("/api/automations");
         if (autoRes.ok) setAutomations(await autoRes.json());
-        const timelineRes = await fetch("/api/timeline");
+        const timelineRes = await authFetch("/api/timeline");
         if (timelineRes.ok) setTimeline(await timelineRes.json());
-        const snapRes = await fetch("/api/replay/snapshots");
+        const snapRes = await authFetch("/api/replay/snapshots");
         if (snapRes.ok) setSnapshots(await snapRes.json());
         await fetchAgents();
         await fetchTasks();
@@ -156,11 +264,13 @@ export default function App() {
         timer = setTimeout(poll, pollDelay);
       }
     };
-    poll();
+    if (!loginOpen || authToken) {
+      poll();
+    }
     return () => {
       if (timer) clearTimeout(timer);
     };
-  }, [fetchAgents, fetchTasks, pollDelay]);
+  }, [authFetch, authToken, fetchAgents, fetchTasks, loginOpen, pollDelay]);
 
   useEffect(() => {
     if (agents.length > 0 && !newTaskAgent) {
@@ -187,6 +297,15 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    if (authToken) {
+      setLoginOpen(false);
+      setLoginError(null);
+    } else {
+      setLoginOpen(true);
+    }
+  }, [authToken]);
+
+  useEffect(() => {
     const timer = setTimeout(() => setShowSplash(false), 1500);
     return () => clearTimeout(timer);
   }, []);
@@ -194,6 +313,7 @@ export default function App() {
   useEffect(() => {
     let socket: WebSocket | null = null;
     const connect = () => {
+      if (!authToken && loginOpen) return;
       socket = new WebSocket(resolveWsUrl());
       setWs(socket);
       socket.onopen = () => {
@@ -222,7 +342,9 @@ export default function App() {
             const existing = msgs.find((m) => m.messageId === mid);
             if (existing) {
               return msgs.map((m) =>
-                m.messageId === mid ? { ...m, content: data.chunk ? m.content + data.chunk : data.content || m.content, streaming: data.type === 'message_chunk' } : m
+                m.messageId === mid
+                  ? { ...m, content: formatValue(data.chunk ? `${m.content}${data.chunk}` : (data.content ?? m.content)), streaming: data.type === 'message_chunk' }
+                  : m
               );
             }
             const newMsg: ChatMessage = {
@@ -231,7 +353,7 @@ export default function App() {
               incidentId: data.incidentId || null,
               role: data.role || 'agent',
               agentId: data.agent_id || data.agentId,
-              content: data.content || data.chunk || '',
+              content: formatValue(data.content ?? data.chunk ?? ''),
               streaming: data.type === 'message_chunk',
               ts: Date.now() / 1000,
             };
@@ -247,7 +369,7 @@ export default function App() {
             incidentId: data.incidentId || null,
             role: 'agent',
             agentId: data.agent_id || 'agent',
-            content: data.response || data.content,
+            content: formatValue(data.response ?? data.content),
             ts: Date.now() / 1000,
           }]);
         }
@@ -255,16 +377,20 @@ export default function App() {
     };
     connect();
     return () => socket?.close();
-  }, []);
+  }, [authToken, loginOpen, resolveWsUrl]);
 
   useEffect(() => {
     const loadProfile = async () => {
       if (!selectedAgentId) return;
       setProfileLoading(true);
       try {
-        const res = await fetch(`/api/agents/${selectedAgentId}/profile`);
-        const data = await res.json();
-        setAgentProfile(data);
+        const res = await authFetch(`/api/agents/${selectedAgentId}/profile`);
+        if (res.ok) {
+          const data = await res.json();
+          setAgentProfile(data);
+        } else {
+          setAgentProfile(null);
+        }
       } catch {
         setAgentProfile(null);
       } finally {
@@ -275,9 +401,13 @@ export default function App() {
       if (!selectedAgentId) return;
       setEventsLoading(true);
       try {
-        const res = await fetch(`/api/agents/${selectedAgentId}/events?limit=100`);
-        const data = await res.json();
-        setAgentEvents(data || []);
+        const res = await authFetch(`/api/agents/${selectedAgentId}/events?limit=100`);
+        if (res.ok) {
+          const data = await res.json();
+          setAgentEvents(data || []);
+        } else {
+          setAgentEvents([]);
+        }
       } catch {
         setAgentEvents([]);
       } finally {
@@ -286,7 +416,7 @@ export default function App() {
     };
     loadProfile();
     loadEvents();
-  }, [selectedAgentId]);
+  }, [authFetch, selectedAgentId]);
 
   const sendMessage = async () => {
     if (!input.trim()) return;
@@ -296,19 +426,11 @@ export default function App() {
     setReplyTo(null);
     setLoading(true);
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ agent_id: 'agent-1', prompt: input, model: 'llama3', parentId: replyTo?.messageId || null, incidentId: replyTo?.incidentId || null }));
+      ws.send(JSON.stringify({ agent_id: 'agent-1', prompt: input, parentId: replyTo?.messageId || null, incidentId: replyTo?.incidentId || null }));
     }
     setLoading(false);
   };
 
-  const runPlugin = async () => {
-    const res = await fetch('/api/caretaker/plugin/example_plugin', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ foo: 'bar' })
-    });
-    setPluginResult(await res.json());
-  };
 
   const handleCreateTask = async () => {
     if (!newTaskDesc.trim() || !newTaskAgent) return;
@@ -325,7 +447,7 @@ export default function App() {
   const openTask = async (task: Task) => {
     setSelectedTask(task);
     try {
-      const res = await fetch(`/api/tasks/${task.id}/messages`);
+      const res = await authFetch(`/api/tasks/${task.id}/messages`);
       if (res.ok) {
         setTaskMessages(await res.json());
       } else {
@@ -339,7 +461,7 @@ export default function App() {
   const sendTaskMessage = async () => {
     if (!selectedTask || !taskMessageInput.trim()) return;
     const payload = { role: 'user', content: taskMessageInput };
-    await fetch(`/api/tasks/${selectedTask.id}/messages`, {
+    await authFetch(`/api/tasks/${selectedTask.id}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -358,17 +480,17 @@ export default function App() {
         ? { type: 'notify', agent_id: 'orchestrator', message: 'Automation ping' }
         : { type: 'create_task', agent_id: newTaskAgent || 'taskwarden', description: 'Auto-created task', priority: newTaskPriority },
     };
-    await fetch('/api/automations', {
+    await authFetch('/api/automations', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    const res = await fetch('/api/automations');
+    const res = await authFetch('/api/automations');
     if (res.ok) setAutomations(await res.json());
   };
 
   const runCouncil = async () => {
-    const res = await fetch('/api/council/query', {
+    const res = await authFetch('/api/council/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt: councilQuestion }),
@@ -380,18 +502,18 @@ export default function App() {
     if (!councilResult) return;
     const lines: string[] = [];
     lines.push(`# Council Session`);
-    lines.push(`Question: ${councilResult.question}`);
+    lines.push(`Question: ${formatValue(councilResult.question)}`);
     lines.push(``);
     lines.push(`## Responses`);
     (councilResult.responses || []).forEach((r: any) => {
-      lines.push(`- **${r.agent}** (${r.mood}): ${r.content}`);
+      lines.push(`- **${r.agent}** (${r.mood}): ${formatValue(r.content)}`);
     });
     lines.push(``);
     lines.push(`## Votes`);
     lines.push(`Most likely cause: ${JSON.stringify(councilResult.votes?.most_likely_cause || {})}`);
     lines.push(`Best fix: ${JSON.stringify(councilResult.votes?.best_fix || {})}`);
     lines.push(``);
-    lines.push(`Summary: ${councilResult.summary}`);
+    lines.push(`Summary: ${formatValue(councilResult.summary)}`);
     const blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -424,10 +546,10 @@ export default function App() {
       <div key={node.messageId} className={`flex ${node.role === 'user' ? 'justify-end' : 'justify-start'}`}>
         {node.role !== 'user' && <AgentAvatar id={node.agentId || 'agent'} mood={agents.find(a => a.agent_id === node.agentId)?.mood} />}
         <div className={`max-w-xl px-4 py-3 rounded-2xl shadow-lg ${node.role === 'user' ? 'bg-blue-600 text-white ml-2' : 'bg-slate-800 text-gray-100 mr-2 border border-slate-700'}`} style={{ marginLeft: depth ? depth * 16 : 0 }}>
-          <div className="text-sm">{node.content}</div>
+          <div className="text-sm">{formatValue(node.content)}</div>
           <div className="text-[11px] text-gray-300 mt-1 flex space-x-3 items-center">
             <span>{new Date(node.ts * 1000).toLocaleTimeString()}</span>
-            <span>⚙ {metrics?.cpu ?? 0}% CPU</span>
+            <span>⚙ CPU {formatPercent(cpuPercent)}</span>
             <button className="text-xs underline" onClick={() => setReplyTo(node)}>Reply</button>
           </div>
           {node.children && node.children.length > 0 && (
@@ -444,7 +566,7 @@ export default function App() {
 
   type PaletteAction = { label: string; action: () => void | Promise<void> };
   const paletteActions: PaletteAction[] = [
-    { label: 'Restart orchestrator', action: () => fetch('/api/agents/orchestrator/start', { method: 'POST' }) },
+    { label: 'Restart orchestrator', action: () => authFetch('/api/agents/orchestrator/start', { method: 'POST' }) },
     { label: 'Fetch agents', action: fetchAgents },
     { label: 'Fetch tasks', action: fetchTasks },
     { label: 'Run diagnostics command', action: () => handleQuickCommands() },
@@ -457,16 +579,50 @@ export default function App() {
     { label: 'Switch to Council', action: () => setActiveTab('council') },
   ];
 
+  const handleLogin = async () => {
+    if (!loginUsername.trim() || !loginPassword) {
+      setLoginError('Enter a username and password.');
+      return;
+    }
+    setLoginLoading(true);
+    setLoginError(null);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: loginUsername, password: loginPassword }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        setLoginError(data?.detail || 'Login failed.');
+        return;
+      }
+      const data = await res.json();
+      setAuthTokens(data.access_token, data.refresh_token);
+      setLoginPassword('');
+      setLoginError(null);
+    } catch (err) {
+      setLoginError(err instanceof Error ? err.message : 'Login failed.');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    clearAuth();
+    setLoginOpen(true);
+  };
+
   return (
     <ToastProvider>
-    <div className="flex flex-col min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-gray-50 relative overflow-hidden">
-      {showGrid && <div className="pointer-events-none absolute inset-0 bg-grid" />}
-      <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-black/30" />
+    <div className="app-shell">
+      {showGrid && <div className="pointer-events-none absolute inset-0 app-grid" />}
+      <div className="pointer-events-none absolute inset-0 app-veil" />
       {showSplash && (
-        <div className="absolute inset-0 z-50 bg-slate-950 flex flex-col items-center justify-center text-center">
-          <div className="w-16 h-16 rounded-full border-4 border-cyan-400 animate-spin mb-4"></div>
-          <div className="text-xl font-bold text-cyan-300 mb-2">Bringing agents online…</div>
-          <div className="text-sm text-gray-400 space-y-1">
+        <div className="app-splash">
+          <div className="splash-spinner"></div>
+          <div className="splash-title">Bringing agents online…</div>
+          <div className="splash-subtitle">
             <div>orchestrator: initializing subsystems</div>
             <div>loadwatch: subscribing to metrics</div>
             <div>firebreak: loading firewall rules</div>
@@ -474,19 +630,18 @@ export default function App() {
         </div>
       )}
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 bg-slate-900/70 backdrop-blur border-b border-slate-800 shadow-lg">
-        <div className="flex items-center space-x-3">
-          <div className="relative w-10 h-10 rounded-full bg-gradient-to-br from-cyan-400 to-blue-600 flex items-center justify-center text-2xl text-white font-bold animate-pulse">
-            FC
-            <div className="absolute inset-0 rounded-full border border-white/30 animate-ping"></div>
+      <header className="app-header">
+        <div className="app-header-left">
+          <div className="app-logo">
+            <span>FC</span>
           </div>
           <div>
-            <div className="text-xl font-bold">FlightCtrl Command</div>
-            <div className="text-xs text-gray-400">Multi-agent ops console</div>
+            <div className="app-title">FlightCtrl Command</div>
+            <div className="app-subtitle">Live multi-agent operations</div>
           </div>
         </div>
-        <div className="flex items-center space-x-2">
-          <div className={`px-2 py-1 text-xs rounded-full ${ws?.readyState === WebSocket.OPEN ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-200'}`}>
+        <div className="app-header-right">
+          <div className={`app-pill ${ws?.readyState === WebSocket.OPEN ? 'online' : 'offline'}`}>
             WS {ws?.readyState === WebSocket.OPEN ? 'online' : 'reconnecting'}
           </div>
           <Button size="sm" variant="ghost" onClick={() => setShowGrid((v) => !v)}>
@@ -503,28 +658,37 @@ export default function App() {
             <option value="minimal">Minimal White</option>
             <option value="hacker">Hacker Green</option>
           </select>
+          {authToken ? (
+            <Button size="sm" variant="ghost" onClick={handleLogout}>
+              Sign out
+            </Button>
+          ) : (
+            <Button size="sm" variant="ghost" onClick={() => setLoginOpen(true)}>
+              Sign in
+            </Button>
+          )}
           <Button size="sm" onClick={() => setIsPaletteOpen(true)}>
             Ctrl/Cmd+K
           </Button>
         </div>
       </header>
       {showStatusBar && (
-        <div className="px-6 py-2 bg-slate-900/60 border-b border-slate-800 text-sm flex items-center space-x-4">
+        <div className="app-statusbar">
           <div className="flex items-center space-x-2">
-            <span className="text-emerald-400">*</span>
+            <span className="status-dot"></span>
             <span>Health: {health ? `${health.status}` : 'loading'}</span>
           </div>
-          <div>CPU: {metrics?.cpu ?? 'n/a'}%</div>
+          <div>CPU: {formatPercent(cpuPercent)}</div>
           <div>Agents: {agents.length}</div>
           <div>Tasks: {tasks.length}</div>
           <div>WS: {ws ? (ws.readyState === WebSocket.OPEN ? 'Connected' : 'Connecting') : 'N/A'}</div>
           <button className="ml-auto text-xs underline" onClick={() => setShowStatusBar(false)}>hide</button>
         </div>
       )}
-      <div className="flex flex-1 relative">
+      <div className="app-body">
         {/* Sidebar */}
-        <aside className="w-72 md:w-20 lg:w-72 bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 p-4 flex flex-col space-y-4 transition-all duration-300">
-          <TabBar>
+        <aside className="app-rail">
+          <TabBar className="rail-nav">
             {[
               { key: 'overview', label: 'Overview' },
               { key: 'chat', label: 'Chat' },
@@ -539,12 +703,11 @@ export default function App() {
                 active={activeTab === tab.key}
                 onClick={() => setActiveTab(tab.key as any)}
               >
-                <span className="hidden lg:inline">{tab.label}</span>
-                <span className="lg:hidden">{tab.label.slice(0,1)}</span>
+                <span>{tab.label}</span>
               </TabBar.Item>
             ))}
           </TabBar>
-          <div className="font-semibold mb-2 text-gray-700 dark:text-gray-200">Agents</div>
+          <div className="rail-title">Agents</div>
           {agentsLoading && <div className="text-gray-400">Loading agents...</div>}
           {agentsError && <div className="text-red-500">Error: {agentsError}</div>}
           <ul className="space-y-2">
@@ -577,7 +740,7 @@ export default function App() {
             ))}
           </ul>
           {/* Task list section */}
-          <div className="font-semibold mt-6 mb-2 text-gray-700 dark:text-gray-200">Tasks</div>
+          <div className="rail-title">Tasks</div>
           {tasksLoading && <div className="text-gray-400">Loading tasks...</div>}
           {tasksError && <div className="text-red-500">Error: {tasksError}</div>}
           <div className="space-y-2">
@@ -601,15 +764,14 @@ export default function App() {
               </Panel>
             ))}
           </div>
-          <div className="mt-6 space-y-2">
+          <div className="rail-form">
             <input
-              className="w-full border rounded px-3 py-2 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100"
-              placeholder="Task description"
+              className="rail-input"
               value={newTaskDesc}
               onChange={(e) => setNewTaskDesc(e.target.value)}
             />
             <select
-              className="w-full border rounded px-3 py-2 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100"
+              className="rail-input"
               value={newTaskAgent}
               onChange={(e) => setNewTaskAgent(e.target.value)}
             >
@@ -617,15 +779,14 @@ export default function App() {
                 <option key={a.agent_id} value={a.agent_id}>{a.agent_id} [{a.role}]</option>
               ))}
             </select>
-            <div className="flex space-x-2">
+            <div className="rail-inline">
               <input
-                className="flex-1 border rounded px-3 py-2 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100"
-                placeholder="Quick command (e.g., Diagnostics sweep)"
+                className="rail-input"
                 value={quickTaskDesc}
                 onChange={(e) => setQuickTaskDesc(e.target.value)}
               />
               <button
-                className="py-2 px-3 bg-emerald-600 text-white rounded hover:bg-emerald-700 transition disabled:opacity-50"
+                className="rail-action"
                 onClick={handleQuickCommands}
                 disabled={tasksLoading || agents.length === 0}
               >
@@ -633,7 +794,7 @@ export default function App() {
               </button>
             </div>
             <button
-              className="w-full py-2 px-4 bg-blue-600 text-white rounded hover:bg-blue-700 transition disabled:opacity-50"
+              className="rail-cta"
               onClick={handleCreateTask}
               disabled={!newTaskDesc.trim() || !newTaskAgent || tasksLoading}
             >
@@ -642,7 +803,36 @@ export default function App() {
           </div>
         </aside>
         {/* Main Panel */}
-        <main className="flex-1 flex flex-col p-6 space-y-6">
+        <main className="app-main">
+          <div className="main-hero">
+            <div>
+              <div className="hero-kicker">Live Control Surface</div>
+              <div className="hero-title">Operations Canvas</div>
+              <div className="hero-subtitle">Streaming telemetry, agent coordination, and incident response in one place.</div>
+            </div>
+            <div className="hero-stats">
+              <div className="hero-stat">
+                <span>CPU</span>
+                <strong>{formatPercent(cpuPercent)}</strong>
+              </div>
+              <div className="hero-stat">
+                <span>Memory</span>
+                <strong>{formatPercent(memPercent)}</strong>
+              </div>
+              <div className="hero-stat">
+                <span>Disk</span>
+                <strong>{formatPercent(diskPercent)}</strong>
+              </div>
+              <div className="hero-stat">
+                <span>Agents</span>
+                <strong>{agents.length}</strong>
+              </div>
+              <div className="hero-stat">
+                <span>Tasks</span>
+                <strong>{tasks.length}</strong>
+              </div>
+            </div>
+          </div>
           {activeTab === 'chat' && (
             <Card className="flex-1 flex flex-col">
               <div className="flex items-center justify-between mb-2">
@@ -652,8 +842,8 @@ export default function App() {
                     <option value="">All agents</option>
                     {agents.map((a) => <option key={a.agent_id} value={a.agent_id}>{a.agent_id}</option>)}
                   </select>
-                  <input className="bg-slate-800 border border-slate-700 rounded px-2 py-1" placeholder="Incident id" value={incidentFilter ?? ''} onChange={(e) => setIncidentFilter(e.target.value || null)} />
-                  <input className="bg-slate-800 border border-slate-700 rounded px-2 py-1" placeholder="Search keyword" value={keywordFilter} onChange={(e) => setKeywordFilter(e.target.value)} />
+                  <input className="bg-slate-800 border border-slate-700 rounded px-2 py-1" value={incidentFilter ?? ''} onChange={(e) => setIncidentFilter(e.target.value || null)} />
+                  <input className="bg-slate-800 border border-slate-700 rounded px-2 py-1" value={keywordFilter} onChange={(e) => setKeywordFilter(e.target.value)} />
                 </div>
               </div>
               {Object.keys(typingAgents).length > 0 && (
@@ -669,7 +859,6 @@ export default function App() {
               <div className="mt-4 flex">
                 <input
                   className="flex-1 border rounded-l px-3 py-2 focus:outline-none"
-                  placeholder={replyTo ? `Replying to ${replyTo.role}` : "Type a message..."}
                   value={input}
                   onChange={e => setInput(e.target.value)}
                   onKeyDown={e => { if (e.key === 'Enter') sendMessage(); }}
@@ -687,10 +876,13 @@ export default function App() {
               <div className="grid grid-cols-3 gap-4">
                 <Card>
                   <div className="font-semibold mb-2">System Metrics</div>
+                  <div className="text-[11px] text-gray-400 mb-3">
+                    Source: {metrics?.source_type || 'unknown'} | Freshness: {metrics?.freshness_seconds ?? 'n/a'}s
+                  </div>
                   <div className="grid grid-cols-3 gap-2 text-sm text-gray-200">
-                    <Gauge label="CPU" value={metrics?.cpu ?? 0} color="#60a5fa" />
-                    <Gauge label="Memory" value={metrics?.memory ? Number(metrics.memory['percent'] ?? 0) : 0} color="#10b981" />
-                    <Gauge label="Disk" value={metrics?.disk ? Number(metrics.disk['percent'] ?? 0) : 0} color="#f59e0b" />
+                    <Gauge label="CPU" value={cpuPercent} color="#60a5fa" />
+                    <Gauge label="Memory" value={memPercent} color="#10b981" />
+                    <Gauge label="Disk" value={diskPercent} color="#f59e0b" />
                   </div>
                 </Card>
                 <Card>
@@ -715,12 +907,41 @@ export default function App() {
                 </Card>
               </div>
               <Card>
+                <div className="font-semibold mb-2">Trust & Provenance</div>
+                <div className="grid md:grid-cols-2 gap-3 text-xs text-gray-300">
+                  {[
+                    { label: 'System Metrics', meta: metrics },
+                    { label: 'Network Flows', meta: flows },
+                    { label: 'Disk I/O', meta: diskIo },
+                    { label: 'Firewall', meta: firewallMeta },
+                  ].map((item) => (
+                    <div key={item.label} className="rounded border border-white/10 p-3 space-y-1">
+                      <div className="text-gray-100 font-medium">{item.label}</div>
+                      <div>Platform: {item.meta?.platform || 'unknown'}</div>
+                      <div>Source: {item.meta?.source_type || 'unknown'}</div>
+                      <div>Freshness: {item.meta?.freshness_seconds ?? 'n/a'}s</div>
+                      <div>Privilege: {item.meta?.provenance?.privilege_level || 'unknown'}</div>
+                      <div>Collectors: {(item.meta?.provenance?.collectors || []).join(', ') || 'n/a'}</div>
+                      <div>Confidence: {typeof item.meta?.confidence === 'number' ? item.meta?.confidence : 'n/a'}</div>
+                      <div className="text-[11px] text-gray-400">
+                        Unavailable: {item.meta?.unavailable?.length ? item.meta.unavailable.map((u: any) => `${u.metric} (${u.reason})`).join('; ') : 'none'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+              <Card>
                 <div className="font-semibold mb-2">Agent Tasks & Status</div>
                 <div className="text-gray-300">Use the Tasks tab to dispatch commands and monitor progress.</div>
               </Card>
               <div className="grid grid-cols-3 gap-4 mt-4">
                 <Card>
                   <div className="font-semibold mb-2">Network Flow Graph</div>
+                  <div className="text-[11px] text-gray-400 mb-2">
+                    Source: {flows?.source_type || 'unknown'} | Freshness: {flows?.freshness_seconds ?? 'n/a'}s
+                    {flows?.host_ip ? ` | Host IP: ${flows.host_ip}` : ''}
+                    {flows?.note ? ` | ${flows.note}` : ''}
+                  </div>
                   <div className="text-xs text-gray-300 space-y-2">
                     {!flows && <div>Loading flows...</div>}
                     {flows && flows.flows.map((f) => (
@@ -741,13 +962,16 @@ export default function App() {
                   <div className="font-semibold mb-2">Disk I/O Ripple</div>
                   {diskIo ? (
                     <div className="text-sm text-gray-200 space-y-2">
-                      <div>IOPS: {diskIo.latest?.iops}</div>
-                      <div>Throughput: {diskIo.latest?.throughput_mb?.toFixed?.(1)} MB/s</div>
+                      <div>IOPS: {diskIops ?? 'n/a'}</div>
+                      <div>Throughput: {diskThroughput !== null ? diskThroughput.toFixed(1) : 'n/a'} MB/s</div>
                       <div className="h-24 bg-slate-900 rounded relative overflow-hidden">
                         <div className="absolute inset-0 flex items-end space-x-1 px-1">
-                          {diskIo.history.slice(-40).map((p, idx) => (
-                            <div key={idx} className="bg-blue-500/60" style={{ width: '4px', height: `${Math.min(100, p.iops / 20)}%` }}></div>
-                          ))}
+                          {diskIo.history.slice(-40).map((p, idx) => {
+                            if (typeof p.iops !== 'number') return null;
+                            return (
+                              <div key={idx} className="bg-blue-500/60" style={{ width: '4px', height: `${Math.min(100, p.iops / 20)}%` }}></div>
+                            );
+                          })}
                         </div>
                       </div>
                     </div>
@@ -756,7 +980,7 @@ export default function App() {
                 <Card>
                   <div className="font-semibold mb-2">Firewall Threats</div>
                   <div className="text-xs text-gray-300 space-y-1 max-h-40 overflow-y-auto">
-                    {firewallLive.map((ev, idx) => (
+                    {firewallEvents?.events?.map((ev, idx) => (
                       <div key={idx} className="flex items-center justify-between">
                         <span>{ev.ip || ev.source}</span>
                         <span className={ev.action === 'deny' || ev.action === 'blocked' ? 'text-red-400' : 'text-emerald-400'}>
@@ -765,7 +989,7 @@ export default function App() {
                         <span className="text-gray-500">{new Date((ev.ts || Date.now()) * 1000).toLocaleTimeString()}</span>
                       </div>
                     ))}
-                    {firewallLive.length === 0 && <div className="text-gray-500">No firewall events yet.</div>}
+                    {(firewallEvents?.events?.length ?? 0) === 0 && <div className="text-gray-500">No firewall events yet.</div>}
                   </div>
                 </Card>
               </div>
@@ -801,7 +1025,7 @@ export default function App() {
                       <div key={idx} className="flex items-center space-x-2">
                         <span className="text-gray-500">{new Date((t.ts || 0) * 1000).toLocaleTimeString()}</span>
                         <span className="uppercase tracking-wide text-[10px] px-1 rounded bg-slate-800 border border-slate-700">{t.type || 'event'}</span>
-                        <span>{t.message || t.action || t.type}</span>
+                        <span>{formatValue(t.message ?? t.action ?? t.type)}</span>
                       </div>
                     ))}
                   </div>
@@ -812,7 +1036,7 @@ export default function App() {
                     {snapshots[replayIndex] && (
                       <div className="text-xs text-gray-300 mt-1">
                         Snapshot @ {new Date(snapshots[replayIndex].ts * 1000).toLocaleTimeString()} |
-                        cpu {snapshots[replayIndex].metrics.cpu}% mem {snapshots[replayIndex].metrics.mem}%
+                        cpu {formatPercent(toPercent(snapshots[replayIndex].metrics?.cpu))} mem {formatPercent(toPercent(snapshots[replayIndex].metrics?.mem))}
                       </div>
                     )}
                   </div>
@@ -860,10 +1084,10 @@ export default function App() {
                   {councilResult && (
                     <div className="text-xs text-gray-300 space-y-1">
                       <div className="font-medium text-gray-100">Summary</div>
-                      <div>{councilResult.summary}</div>
+                      <div>{formatValue(councilResult.summary)}</div>
                       <div className="font-medium text-gray-100 mt-2">Votes</div>
-                      <div>Likely cause: {councilResult.votes?.most_likely_cause}</div>
-                      <div>Best fix: {councilResult.votes?.best_fix}</div>
+                      <div>Likely cause: {JSON.stringify(councilResult.votes?.most_likely_cause || {})}</div>
+                      <div>Best fix: {JSON.stringify(councilResult.votes?.best_fix || {})}</div>
                     </div>
                   )}
                 </Panel>
@@ -879,7 +1103,6 @@ export default function App() {
                     <div className="text-sm font-medium text-gray-700 dark:text-gray-200">Create Task</div>
                   <input
                     className="w-full border rounded px-3 py-2 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100"
-                    placeholder="Task description"
                     value={newTaskDesc}
                     onChange={(e) => setNewTaskDesc(e.target.value)}
                   />
@@ -904,7 +1127,6 @@ export default function App() {
                   <div className="flex space-x-2">
                     <input
                       className="flex-1 border rounded px-3 py-2 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100"
-                      placeholder="Quick command (e.g., Diagnostics sweep)"
                       value={quickTaskDesc}
                       onChange={(e) => setQuickTaskDesc(e.target.value)}
                     />
@@ -946,7 +1168,7 @@ export default function App() {
                           {(task.status_history || []).slice(-4).map((h, idx) => (
                             <div key={idx} className="flex items-center space-x-2">
                               <span className="uppercase">{h.status}</span>
-                              <span>{h.note}</span>
+                              <span>{formatValue(h.note)}</span>
                               <span className="text-gray-600">{new Date(h.ts * 1000).toLocaleTimeString()}</span>
                             </div>
                           ))}
@@ -962,7 +1184,7 @@ export default function App() {
                   <Panel className="space-y-2">
                     <div className="text-sm font-medium">New Automation</div>
                     <input className="w-full border rounded px-3 py-2 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100"
-                      value={autoName} onChange={(e) => setAutoName(e.target.value)} placeholder="Name" />
+                      value={autoName} onChange={(e) => setAutoName(e.target.value)} />
                     <div className="flex items-center space-x-2">
                       <span className="text-sm text-gray-400">Every</span>
                       <input type="number" min={10} className="w-24 border rounded px-2 py-1 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100"
@@ -1011,12 +1233,14 @@ export default function App() {
                       <div key={f.remote} className="border border-slate-700 rounded p-2 text-xs text-gray-200">
                         <div className="flex justify-between items-center">
                           <span>{f.remote}</span>
-                          <span className={f.allowed ? 'text-emerald-400' : 'text-red-400'}>{f.allowed ? 'allowed' : 'blocked'}</span>
+                          <span className={f.allowed === false ? 'text-red-400' : f.allowed === true ? 'text-emerald-400' : 'text-slate-400'}>
+                            {f.allowed === false ? 'blocked' : f.allowed === true ? 'allowed' : 'unknown'}
+                          </span>
                         </div>
                         <div className="text-[11px] text-gray-400">Threat {f.threat_score}</div>
                         <div className="flex space-x-2 mt-1">
-                          <Button size="sm" variant="outline" onClick={() => fetch('/api/firewall/allow?ip=' + f.remote, { method: 'POST' })}>Allow</Button>
-                          <Button size="sm" variant="outline" tone="danger" onClick={() => fetch('/api/firewall/deny?ip=' + f.remote, { method: 'POST' })}>Deny</Button>
+                          <Button size="sm" variant="outline" onClick={() => authFetch('/api/firewall/allow?ip=' + f.remote, { method: 'POST' })}>Allow</Button>
+                          <Button size="sm" variant="outline" tone="danger" onClick={() => authFetch('/api/firewall/deny?ip=' + f.remote, { method: 'POST' })}>Deny</Button>
                         </div>
                       </div>
                     ))}
@@ -1025,17 +1249,17 @@ export default function App() {
                 <Panel className="space-y-2">
                   <div className="text-sm font-medium">Firewall Rules</div>
                   <div className="space-y-1 max-h-64 overflow-y-auto">
-                    {firewallRulesState.map((r) => (
+                    {firewallRulesState?.rules?.map((r) => (
                       <div key={r.id} className="text-xs text-gray-200 border border-slate-700 rounded px-2 py-1 flex items-center justify-between">
                         <span>{r.source} → {r.dest || 'host'}</span>
                         <span className={r.action === 'deny' ? 'text-red-400' : 'text-emerald-400'}>{r.action}</span>
                       </div>
                     ))}
-                    {firewallRulesState.length === 0 && <div className="text-gray-500 text-sm">No rules defined.</div>}
+                    {(firewallRulesState?.rules?.length ?? 0) === 0 && <div className="text-gray-500 text-sm">No rules defined.</div>}
                   </div>
                   <div className="text-sm font-medium mt-2">Recent events</div>
                   <div className="space-y-1 max-h-32 overflow-y-auto text-xs text-gray-300">
-                    {firewallLive.map((ev, idx) => (
+                    {firewallEvents?.events?.map((ev, idx) => (
                       <div key={idx} className="flex items-center space-x-2">
                         <span className={ev.action === 'deny' ? 'text-red-400' : 'text-emerald-400'}>{ev.action}</span>
                         <span>{ev.ip || ev.source}</span>
@@ -1045,8 +1269,6 @@ export default function App() {
                   </div>
                 </Panel>
               </div>
-              <Button onClick={runPlugin} className="mt-4">Run Example Plugin</Button>
-              {pluginResult && <pre className="mt-2 text-xs bg-gray-900 text-white p-2 rounded">{JSON.stringify(pluginResult, null, 2)}</pre>}
             </Card>
           )}
 
@@ -1070,7 +1292,7 @@ export default function App() {
                       const x = 300 + r * Math.cos(angle);
                       const y = 180 + r * Math.sin(angle);
                       const width = Math.min(6, Math.max(2, (f.bytes_in + f.bytes_out) / 120000));
-                      const color = f.allowed ? '#22c55e' : '#ef4444';
+                      const color = f.allowed === false ? '#ef4444' : f.allowed === true ? '#22c55e' : '#94a3b8';
                       return (
                         <g key={f.remote} onClick={() => setSelectedNode(f.remote)} style={{ cursor: 'pointer' }}>
                           <line x1="300" y1="180" x2={x} y2={y} stroke={color} strokeWidth={width} strokeOpacity="0.7">
@@ -1095,22 +1317,23 @@ export default function App() {
                           <div>Bytes in/out: {f.bytes_in}/{f.bytes_out}</div>
                           <div>Threat: {f.threat_score}</div>
                           <div className="flex space-x-2">
-                            <Button size="sm" variant="outline" onClick={() => fetch('/api/firewall/allow?ip=' + f.remote, { method: 'POST' })}>Allow</Button>
-                            <Button size="sm" variant="outline" tone="danger" onClick={() => fetch('/api/firewall/deny?ip=' + f.remote, { method: 'POST' })}>Deny</Button>
+                            <Button size="sm" variant="outline" onClick={() => authFetch('/api/firewall/allow?ip=' + f.remote, { method: 'POST' })}>Allow</Button>
+                            <Button size="sm" variant="outline" tone="danger" onClick={() => authFetch('/api/firewall/deny?ip=' + f.remote, { method: 'POST' })}>Deny</Button>
                           </div>
                         </div>
                       );
                     })()
                   ) : <div className="text-sm text-gray-400">Click a node to inspect.</div>}
-                  <div className="text-sm font-medium mt-3">Geo Regions (mock)</div>
-                  <div className="flex space-x-2 text-xs">
-                    <span className="px-2 py-1 bg-emerald-500/20 text-emerald-300 rounded">NA: 5</span>
-                    <span className="px-2 py-1 bg-amber-500/20 text-amber-200 rounded">EU: 3</span>
-                    <span className="px-2 py-1 bg-red-500/20 text-red-200 rounded">APAC: 2</span>
+                  <div className="text-sm font-medium mt-3">Traffic Summary</div>
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    <span className="px-2 py-1 bg-slate-700/50 text-slate-200 rounded">Total: {flowSummary.total}</span>
+                    <span className="px-2 py-1 bg-emerald-500/20 text-emerald-300 rounded">Allowed: {flowSummary.allowed}</span>
+                    <span className="px-2 py-1 bg-red-500/20 text-red-200 rounded">Blocked: {flowSummary.blocked}</span>
+                    <span className="px-2 py-1 bg-amber-500/20 text-amber-200 rounded">Unknown: {flowSummary.unknown}</span>
                   </div>
                   <div className="text-sm font-medium mt-3">Firewall Timeline</div>
                   <div className="space-y-1 max-h-32 overflow-y-auto text-xs text-gray-300">
-                    {firewallLive.map((ev, idx) => (
+                    {firewallEvents?.events?.map((ev, idx) => (
                       <div key={idx} className="flex items-center space-x-2">
                         <span className={ev.action === 'deny' ? 'text-red-400' : 'text-emerald-400'}>{ev.action}</span>
                         <span>{ev.ip || ev.source}</span>
@@ -1136,7 +1359,6 @@ export default function App() {
                       className="flex-1 bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm"
                       value={councilQuestion}
                       onChange={(e) => setCouncilQuestion(e.target.value)}
-                      placeholder="Ask the council..."
                     />
                     <Button onClick={runCouncil}>Send</Button>
                     <Button variant="outline" onClick={() => {
@@ -1158,15 +1380,15 @@ export default function App() {
                               <AgentAvatar id={r.agent} mood={r.mood} />
                               <div className="font-semibold">{r.agent}</div>
                             </div>
-                            <div className="text-xs text-gray-300">{r.content}</div>
+                            <div className="text-xs text-gray-300">{formatValue(r.content)}</div>
                           </Panel>
                         ))}
                       </div>
                       <Panel>
                         <div className="font-semibold text-sm">Summary</div>
-                        <div className="text-sm text-gray-200">{councilResult.summary}</div>
-                        <div className="mt-2 text-xs text-gray-300">Most likely cause: {councilResult.votes?.most_likely_cause}</div>
-                        <div className="text-xs text-gray-300">Best fix: {councilResult.votes?.best_fix}</div>
+                        <div className="text-sm text-gray-200">{formatValue(councilResult.summary)}</div>
+                        <div className="mt-2 text-xs text-gray-300">Most likely cause: {JSON.stringify(councilResult.votes?.most_likely_cause || {})}</div>
+                        <div className="text-xs text-gray-300">Best fix: {JSON.stringify(councilResult.votes?.best_fix || {})}</div>
                       </Panel>
                     </>
                   ) : (
@@ -1175,8 +1397,8 @@ export default function App() {
                 </Panel>
                 <Panel className="space-y-2">
                   <div className="text-sm font-medium">Incident Search</div>
-                  <input className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm" placeholder="Keyword..." onChange={async (e) => {
-                    const res = await fetch('/api/incidents/search?keyword=' + encodeURIComponent(e.target.value));
+                  <input className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm" onChange={async (e) => {
+                    const res = await authFetch('/api/incidents/search?keyword=' + encodeURIComponent(e.target.value));
                     if (res.ok) setTimeline(await res.json());
                   }} />
                   <div className="text-xs text-gray-300 max-h-64 overflow-y-auto space-y-1">
@@ -1186,7 +1408,7 @@ export default function App() {
                           <span>{new Date((t.ts || 0) * 1000).toLocaleTimeString()}</span>
                           <span className="uppercase">{t.type}</span>
                         </div>
-                        <div className="text-sm text-gray-200">{t.message}</div>
+                        <div className="text-sm text-gray-200">{formatValue(t.message)}</div>
                       </div>
                     ))}
                   </div>
@@ -1204,7 +1426,6 @@ export default function App() {
               <input
                 autoFocus
                 className="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"
-                placeholder="Search commands..."
               />
             </div>
             <div className="space-y-1 max-h-80 overflow-y-auto">
@@ -1221,6 +1442,39 @@ export default function App() {
           </div>
         </div>
       )}
+      <Modal open={loginOpen} onClose={() => setLoginOpen(false)} title="Sign in">
+        <div className="space-y-3">
+          <div className="text-xs text-gray-400">Use your FlightCtrl credentials.</div>
+          <div>
+            <div className="text-xs text-gray-400 mb-1">Username</div>
+            <input
+              className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm"
+              value={loginUsername}
+              onChange={(e) => setLoginUsername(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleLogin(); }}
+            />
+          </div>
+          <div>
+            <div className="text-xs text-gray-400 mb-1">Password</div>
+            <input
+              className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm"
+              type="password"
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleLogin(); }}
+            />
+          </div>
+          {loginError && <div className="text-xs text-red-400">{loginError}</div>}
+          <div className="flex justify-end space-x-2">
+            <Button variant="ghost" onClick={() => setLoginOpen(false)} disabled={loginLoading}>
+              Close
+            </Button>
+            <Button onClick={handleLogin} disabled={loginLoading}>
+              {loginLoading ? 'Signing in...' : 'Sign in'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
       <Drawer open={!!selectedTask} onClose={() => setSelectedTask(null)} title={selectedTask ? `Task ${selectedTask.id}` : ''}>
         {selectedTask && (
           <div className="space-y-3 text-sm text-gray-200">
@@ -1237,7 +1491,7 @@ export default function App() {
                 {(selectedTask.status_history || []).map((h: { status: string; ts: number; note?: string }, idx: number) => (
                   <div key={idx} className="flex items-center space-x-2 text-xs">
                     <span className="uppercase">{h.status}</span>
-                    <span>{h.note}</span>
+                    <span>{formatValue(h.note)}</span>
                     <span className="text-gray-500">{new Date(h.ts * 1000).toLocaleTimeString()}</span>
                   </div>
                 ))}
@@ -1250,13 +1504,13 @@ export default function App() {
                 {taskMessages.map((m) => (
                   <div key={m.id} className="text-xs text-gray-200">
                     <span className="text-gray-500 mr-2">{new Date(m.ts * 1000).toLocaleTimeString()}</span>
-                    <span className="font-semibold">{m.role}:</span> {m.content}
+                    <span className="font-semibold">{m.role}:</span> {formatValue(m.content)}
                   </div>
                 ))}
                 {taskMessages.length === 0 && <div className="text-gray-500 text-xs">No messages yet.</div>}
               </div>
               <div className="mt-2 flex space-x-2">
-                <input className="flex-1 bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm" value={taskMessageInput} onChange={(e) => setTaskMessageInput(e.target.value)} placeholder="Add message..." />
+                <input className="flex-1 bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm" value={taskMessageInput} onChange={(e) => setTaskMessageInput(e.target.value)} />
                 <Button onClick={sendTaskMessage}>Send</Button>
               </div>
             </div>

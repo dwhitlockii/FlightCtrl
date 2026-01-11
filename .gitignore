@@ -1,0 +1,8 @@
+.env
+.env.*
+node_modules/
+frontend/dist/
+backend/venv/
+__pycache__/
+*.pyc
+telemetry_agent.log
