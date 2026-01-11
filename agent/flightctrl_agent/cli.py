@@ -54,12 +54,12 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument(
         "--token",
         default=os.getenv(TOKEN_ENV),
-        help="Admin JWT token for ingest (default from FLIGHTCTRL_TOKEN)",
+        help="Admin JWT token for ingest (default from FLIGHTCTRL_TOKEN; prefer telemetry key)",
     )
     parser.add_argument(
         "--telemetry-key",
         default=os.getenv(TELEMETRY_KEY_ENV),
-        help="Telemetry API key (default from FLIGHTCTRL_TELEMETRY_KEY)",
+        help="Telemetry API key for X-Telemetry-Key (default from FLIGHTCTRL_TELEMETRY_KEY)",
     )
     parser.add_argument(
         "--once",
@@ -78,7 +78,7 @@ def main(argv: Optional[list] = None) -> None:
     privilege = detect_privilege_level()
     _log(f"starting agent platform={platform_key} privilege={privilege} backend={backend}")
     if not args.token and not args.telemetry_key:
-        _log("no auth provided: set FLIGHTCTRL_TOKEN or FLIGHTCTRL_TELEMETRY_KEY if backend requires auth")
+        _log("no auth provided: set FLIGHTCTRL_TELEMETRY_KEY (recommended) or FLIGHTCTRL_TOKEN if backend requires auth")
     state = DiskIoState()
     while True:
         payload = collect_snapshot(state)

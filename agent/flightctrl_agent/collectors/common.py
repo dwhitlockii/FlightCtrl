@@ -56,17 +56,27 @@ def detect_privilege_level() -> str:
         return "unknown"
 
 
-def detect_container() -> bool:
+def detect_container() -> Optional[bool]:
     if os.name == "nt":
-        return False
+        return None
     if os.path.exists("/.dockerenv"):
         return True
+    if os.path.exists("/run/.containerenv"):
+        return True
+    if os.getenv("container") or os.getenv("CONTAINER"):
+        return True
+    if os.getenv("KUBERNETES_SERVICE_HOST"):
+        return True
+    system = platform.system().lower()
+    if system.startswith("darwin"):
+        return None
     cgroup_path = "/proc/1/cgroup"
     if os.path.exists(cgroup_path):
         try:
-            content = open(cgroup_path, "r", encoding="utf-8").read()
+            with open(cgroup_path, "r", encoding="utf-8") as handle:
+                content = handle.read()
         except Exception:
-            return False
+            return None
         for marker in ("docker", "containerd", "kubepods", "lxc"):
             if marker in content:
                 return True
@@ -301,15 +311,23 @@ def collect_disk_io(state: DiskIoState) -> CollectorResult:
         state.last_ts = now
         unavailable.append(unavailable_entry(
             "disk_iops",
-            "Insufficient history to compute IOPS",
+            "Rate unavailable until second sample",
             "Wait for the next sampling interval.",
         ))
         unavailable.append(unavailable_entry(
             "disk_throughput",
-            "Insufficient history to compute throughput",
+            "Rate unavailable until second sample",
             "Wait for the next sampling interval.",
         ))
         return CollectorResult({
+            "read_bytes_total": counters.read_bytes,
+            "write_bytes_total": counters.write_bytes,
+            "read_ops_total": counters.read_count,
+            "write_ops_total": counters.write_count,
+            "read_bytes_delta": None,
+            "write_bytes_delta": None,
+            "read_ops_delta": None,
+            "write_ops_delta": None,
             "read_bytes_per_sec": None,
             "write_bytes_per_sec": None,
             "read_ops_per_sec": None,
@@ -317,7 +335,8 @@ def collect_disk_io(state: DiskIoState) -> CollectorResult:
             "iops": None,
             "throughput_bytes_per_sec": None,
             "throughput_mb": None,
-        }, unavailable, collectors, None)
+            "note": "rate unavailable until second sample",
+        }, unavailable, collectors, now)
     elapsed = max(now - state.last_ts, 0.1)
     read_bytes = counters.read_bytes - state.last_counters.read_bytes
     write_bytes = counters.write_bytes - state.last_counters.write_bytes
@@ -332,6 +351,14 @@ def collect_disk_io(state: DiskIoState) -> CollectorResult:
     state.last_counters = counters
     state.last_ts = now
     data = {
+        "read_bytes_total": counters.read_bytes,
+        "write_bytes_total": counters.write_bytes,
+        "read_ops_total": counters.read_count,
+        "write_ops_total": counters.write_count,
+        "read_bytes_delta": read_bytes,
+        "write_bytes_delta": write_bytes,
+        "read_ops_delta": read_count,
+        "write_ops_delta": write_count,
         "read_bytes_per_sec": round(read_bps, 2),
         "write_bytes_per_sec": round(write_bps, 2),
         "read_ops_per_sec": round(read_ops, 2),

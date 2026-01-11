@@ -279,8 +279,18 @@ class TelemetryStore:
 
     def get_disk_io(self) -> Dict:
         with self._lock:
-            if self._external_fresh(self._external_snapshot_ts) and self._external_disk_io_detail:
-                return {"latest": dict(self._external_disk_io_detail), "history": list(self._disk_io_history), "source": "external"}
+            if self._external_fresh(self._external_snapshot_ts):
+                if self._external_disk_io_detail:
+                    return {"latest": dict(self._external_disk_io_detail), "history": list(self._disk_io_history), "source": "external"}
+                return {
+                    "latest": {
+                        "iops": None,
+                        "throughput_mb": None,
+                        "note": "disk I/O data missing from external agent",
+                    },
+                    "history": [],
+                    "source": "external",
+                }
             point = self._collect_disk_io_locked()
             history = list(self._disk_io_history)
         return {"latest": point, "history": history, "source": "local"}

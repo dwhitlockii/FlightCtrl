@@ -59,11 +59,18 @@ def collect_snapshot(state: DiskIoState) -> Dict:
     _merge_unavailable(unavailable, network.unavailable)
     _merge_unavailable(unavailable, firewall.unavailable)
 
-    if detect_container():
+    container_state = detect_container()
+    if container_state is True:
         unavailable.append(unavailable_entry(
             "host_telemetry",
             "Agent appears to be running inside a container",
             "Run the agent directly on the host OS to avoid container-scoped telemetry.",
+        ))
+    elif container_state is None:
+        unavailable.append(unavailable_entry(
+            "container_detection",
+            "Container detection unsupported on this platform",
+            "Verify the agent is running on the host OS (not inside a container).",
         ))
 
     collectors_by_subsystem = {

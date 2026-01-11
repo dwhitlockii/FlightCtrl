@@ -37,10 +37,20 @@
 ## Running the Host Telemetry Agent
 The backend uses the external agent as the source of truth for host telemetry.
 
+### Telemetry ingest auth
+Canonical agent credential: `FLIGHTCTRL_TELEMETRY_KEY` (recommended).
+- Agent header: `X-Telemetry-Key: <key>`
+- Backend expects: `TELEMETRY_API_KEY=<key>`
+Admin JWTs are also accepted for ingest:
+- `Authorization: Bearer <admin_jwt>`
+Errors:
+- `401 Unauthorized`: missing/invalid key or token.
+- `403 Forbidden`: token valid but not admin.
+
 ### Windows
 ```sh
 python -m pip install -r agent/requirements.txt
-set FLIGHTCTRL_TOKEN=your_admin_jwt
+set FLIGHTCTRL_TELEMETRY_KEY=your_agent_key
 python -m flightctrl_agent --backend http://127.0.0.1:8000 --interval 2
 ```
 Run in an Administrator shell to access full network/firewall metrics.
@@ -48,7 +58,7 @@ Run in an Administrator shell to access full network/firewall metrics.
 ### Linux
 ```sh
 python -m pip install -r agent/requirements.txt
-export FLIGHTCTRL_TOKEN=your_admin_jwt
+export FLIGHTCTRL_TELEMETRY_KEY=your_agent_key
 sudo -E python -m flightctrl_agent --backend http://127.0.0.1:8000 --interval 2
 ```
 Use sudo for full network and firewall visibility.
@@ -56,7 +66,7 @@ Use sudo for full network and firewall visibility.
 ### macOS
 ```sh
 python -m pip install -r agent/requirements.txt
-export FLIGHTCTRL_TOKEN=your_admin_jwt
+export FLIGHTCTRL_TELEMETRY_KEY=your_agent_key
 sudo -E python -m flightctrl_agent --backend http://127.0.0.1:8000 --interval 2
 ```
 Use sudo to access pf firewall state and full socket visibility.

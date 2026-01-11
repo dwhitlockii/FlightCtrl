@@ -88,7 +88,7 @@ real metrics/flows into the backend:
 python -m pip install -r agent/requirements.txt
 python -m flightctrl_agent --backend http://127.0.0.1:8000 --interval 2
 ```
-If auth is enabled, set `FLIGHTCTRL_TOKEN` or `FLIGHTCTRL_TELEMETRY_KEY` before running.
+If auth is enabled, set `FLIGHTCTRL_TELEMETRY_KEY` (recommended) or `FLIGHTCTRL_TOKEN` before running.
 For managed start/stop:
 ```sh
 ./scripts/telemetry_agent_ctl.sh start
@@ -96,6 +96,16 @@ For managed start/stop:
 ./scripts/telemetry_agent_ctl.sh stop
 ```
 On macOS and Linux, run with sudo for full network/firewall visibility.
+
+#### Telemetry ingest auth
+Canonical agent credential: `FLIGHTCTRL_TELEMETRY_KEY` (recommended).
+- Agent header: `X-Telemetry-Key: <key>`
+- Backend expects: `TELEMETRY_API_KEY=<key>` (server-side)
+Admin JWTs are also accepted for ingest (separate from agent usage):
+- Header: `Authorization: Bearer <admin_jwt>`
+Errors:
+- `401 Unauthorized`: missing/invalid key or token. Remediation: set `TELEMETRY_API_KEY` on backend and `FLIGHTCTRL_TELEMETRY_KEY` in the agent.
+- `403 Forbidden`: token valid but not admin. Remediation: use an admin token or a telemetry key.
 
 ### Backend
 ```sh

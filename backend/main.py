@@ -2305,6 +2305,14 @@ class DiskUsage(BaseModel):
 
 
 class DiskIO(BaseModel):
+    read_bytes_total: Optional[int] = None
+    write_bytes_total: Optional[int] = None
+    read_ops_total: Optional[int] = None
+    write_ops_total: Optional[int] = None
+    read_bytes_delta: Optional[int] = None
+    write_bytes_delta: Optional[int] = None
+    read_ops_delta: Optional[int] = None
+    write_ops_delta: Optional[int] = None
     read_bytes_per_sec: Optional[float] = None
     write_bytes_per_sec: Optional[float] = None
     read_ops_per_sec: Optional[float] = None
@@ -2312,6 +2320,7 @@ class DiskIO(BaseModel):
     iops: Optional[float] = None
     throughput_bytes_per_sec: Optional[float] = None
     throughput_mb: Optional[float] = None
+    note: Optional[str] = None
 
 
 class DiskData(BaseModel):
