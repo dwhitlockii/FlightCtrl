@@ -5,5 +5,7 @@ httpx
 redis  # Redis client for agent state persistence
 pydantic
 watchdog
-pytest
 psutil  # System monitoring 
+python-jose
+passlib[bcrypt]
+bcrypt<5
